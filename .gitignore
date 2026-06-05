@@ -1,0 +1,14 @@
+/target
+.env
+config.toml
+*.db
+.trae
+.shared
+.claude
+nul
+.playwright-cli
+.omx
+node_modules
+*.txt
+/db-data
+.DS_Store
