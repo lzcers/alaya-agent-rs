@@ -1,11 +1,78 @@
 use crate::agent::{ToolCall, ToolDef};
 use crate::core::MessageRole;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Unexpected};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+
+fn value_to_u32_lossy<E>(value: Value) -> Result<u32, E>
+where
+    E: de::Error,
+{
+    match value {
+        Value::Number(n) => {
+            if let Some(v) = n.as_u64() {
+                u32::try_from(v).map_err(|_| E::invalid_value(Unexpected::Unsigned(v), &"u32"))
+            } else if let Some(v) = n.as_i64() {
+                u32::try_from(v).map_err(|_| E::invalid_value(Unexpected::Signed(v), &"u32"))
+            } else if let Some(v) = n.as_f64() {
+                if v.is_finite() && v >= 0.0 && v <= u32::MAX as f64 {
+                    Ok(v.round() as u32)
+                } else {
+                    Err(E::invalid_value(
+                        Unexpected::Float(v),
+                        &"finite non-negative u32",
+                    ))
+                }
+            } else {
+                Err(E::custom("invalid number for u32"))
+            }
+        }
+        Value::String(s) => {
+            if let Ok(v) = s.parse::<u32>() {
+                Ok(v)
+            } else if let Ok(v) = s.parse::<f64>() {
+                if v.is_finite() && v >= 0.0 && v <= u32::MAX as f64 {
+                    Ok(v.round() as u32)
+                } else {
+                    Err(E::invalid_value(
+                        Unexpected::Float(v),
+                        &"finite non-negative u32",
+                    ))
+                }
+            } else {
+                Err(E::invalid_value(
+                    Unexpected::Str(&s),
+                    &"u32-compatible number",
+                ))
+            }
+        }
+        other => Err(E::custom(format!(
+            "expected u32-compatible number, got {}",
+            other
+        ))),
+    }
+}
+
+fn deserialize_u32_lossy<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    value_to_u32_lossy(Value::deserialize(deserializer)?)
+}
+
+fn deserialize_option_u32_lossy<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        Some(value) => value_to_u32_lossy(value).map(Some),
+        None => Ok(None),
+    }
+}
 
 /// Provider trait - LLM API 提供商的统一接口
 #[async_trait]
@@ -32,14 +99,28 @@ pub trait Provider: Send + Sync {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Usage {
     #[serde(alias = "input_tokens")]
+    #[serde(deserialize_with = "deserialize_u32_lossy")]
     pub prompt_tokens: u32,
     #[serde(alias = "output_tokens")]
+    #[serde(deserialize_with = "deserialize_u32_lossy")]
     pub completion_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_lossy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub total_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_lossy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub prompt_cache_hit_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_u32_lossy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub prompt_cache_miss_tokens: Option<u32>,
 }
 
@@ -233,6 +314,14 @@ pub struct ChoiceImg {
     pub image_url: ChoiceImgUrl,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChoiceAudio {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+}
+
 /// 选择项中的消息（非流式响应）
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChoiceMessage {
@@ -253,6 +342,7 @@ pub struct ChoiceMessage {
 /// 非流式响应的选择项
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Choice {
+    #[serde(deserialize_with = "deserialize_u32_lossy")]
     pub index: u32,
     pub message: ChoiceMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,12 +378,15 @@ pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<ChoiceAudio>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// 流式响应的选择项
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamChoice {
+    #[serde(deserialize_with = "deserialize_u32_lossy")]
     pub index: u32,
     pub delta: Delta,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -317,7 +410,7 @@ pub struct StreamResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, Response};
+    use super::{Request, Response, StreamResponse};
     use crate::core::Message;
     use serde_json::json;
 
@@ -356,6 +449,81 @@ mod tests {
             choice.message.images.unwrap()[0].image_url.url,
             "https://example.com/image.png"
         );
+    }
+
+    #[test]
+    fn test_response_allows_float_u32_fields() {
+        let body = r#"{
+            "id": "resp_123",
+            "object": "chat.completion",
+            "created": 1743916800,
+            "model": "black-forest-labs/flux.2-klein-4b",
+            "choices": [
+                {
+                    "index": 14417.92,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "images": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://example.com/image.png"
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1.2,
+                "completion_tokens": "2.7",
+                "total_tokens": 3.9,
+                "prompt_cache_hit_tokens": "4",
+                "prompt_cache_miss_tokens": null
+            }
+        }"#;
+
+        let response: Response = serde_json::from_str(body).unwrap();
+        let choice = response.choices.into_iter().next().unwrap();
+        let usage = response.usage.unwrap();
+
+        assert_eq!(choice.index, 14418);
+        assert_eq!(usage.prompt_tokens, 1);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, Some(4));
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(4));
+        assert_eq!(usage.prompt_cache_miss_tokens, None);
+    }
+
+    #[test]
+    fn test_stream_response_allows_audio_delta() {
+        let body = r#"{
+            "id": "chunk_123",
+            "object": "chat.completion.chunk",
+            "created": 1743916800,
+            "model": "google/lyria-3-clip-preview",
+            "system_fingerprint": null,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "audio": {
+                            "data": "YWJj",
+                            "transcript": "hello"
+                        }
+                    },
+                    "finish_reason": null
+                }
+            ]
+        }"#;
+
+        let response: StreamResponse = serde_json::from_str(body).unwrap();
+        let audio = response.choices[0].delta.audio.as_ref().unwrap();
+
+        assert_eq!(audio.data.as_deref(), Some("YWJj"));
+        assert_eq!(audio.transcript.as_deref(), Some("hello"));
     }
 
     #[test]

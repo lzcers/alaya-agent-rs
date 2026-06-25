@@ -1,10 +1,12 @@
 mod chat_model;
+mod gen_audio_model;
 mod gen_img_model;
 
 use crate::agent::ToolCall;
 use crate::core::Usage;
 use async_trait::async_trait;
 pub use chat_model::ChatModel;
+pub use gen_audio_model::GenAudioModel;
 pub use gen_img_model::GenImgModel;
 
 use futures::stream::BoxStream;
@@ -71,4 +73,22 @@ pub struct GenImgResponse {
 pub trait GenImgCapability {
     /// 生成图片
     async fn gen_img(&self, msgs: Vec<Message>) -> Result<GenImgResponse, ChatError>;
+}
+
+/// 音频生成响应
+#[derive(Debug, Clone)]
+pub struct GenAudioResponse {
+    /// base64 编码的音频数据
+    pub audio_data: String,
+    /// 模型返回的转写文本；音乐模型可能为空
+    pub transcript: String,
+    /// 音频格式，如 wav/mp3/flac
+    pub format: String,
+}
+
+// 音频生成能力 trait
+#[async_trait]
+pub trait GenAudioCapability {
+    /// 生成音频
+    async fn gen_audio(&self, msgs: Vec<Message>) -> Result<GenAudioResponse, ChatError>;
 }
