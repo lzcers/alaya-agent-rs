@@ -16,6 +16,8 @@ pub struct OpenAICompatibleProvider {
     base_url: String,
     extra_headers: HashMap<String, String>,
     name: String,
+    timeout: Duration,
+    proxy_url: Option<String>,
 }
 
 impl OpenAICompatibleProvider {
@@ -30,17 +32,16 @@ impl OpenAICompatibleProvider {
         api_key: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .expect("Failed to build HTTP client");
+        let timeout = Duration::from_secs(120);
 
         Self {
-            client,
+            client: build_http_client(timeout, None),
             api_key: api_key.into(),
             base_url: base_url.into(),
             extra_headers: HashMap::new(),
             name: name.into(),
+            timeout,
+            proxy_url: None,
         }
     }
 
@@ -52,10 +53,15 @@ impl OpenAICompatibleProvider {
 
     /// 设置请求超时时间
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("Failed to build HTTP client");
+        self.timeout = timeout;
+        self.client = build_http_client(self.timeout, self.proxy_url.as_deref());
+        self
+    }
+
+    /// 设置请求代理
+    pub fn with_proxy(mut self, proxy_url: impl Into<String>) -> Self {
+        self.proxy_url = Some(proxy_url.into());
+        self.client = build_http_client(self.timeout, self.proxy_url.as_deref());
         self
     }
 
@@ -89,6 +95,16 @@ impl OpenAICompatibleProvider {
 
         headers
     }
+}
+
+fn build_http_client(timeout: Duration, proxy_url: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+
+    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|url| !url.is_empty()) {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url).expect("Invalid proxy URL"));
+    }
+
+    builder.build().expect("Failed to build HTTP client")
 }
 
 fn drain_sse_frames(buffer: &mut String) -> Vec<String> {
@@ -239,6 +255,17 @@ mod tests {
 
         // 验证 provider 创建成功
         assert_eq!(provider.name(), "test");
+    }
+
+    #[test]
+    fn test_with_proxy_preserves_timeout() {
+        let provider =
+            OpenAICompatibleProvider::new("test", "test-api-key", "https://api.example.com")
+                .with_proxy("http://127.0.0.1:7890")
+                .with_timeout(Duration::from_secs(60));
+
+        assert_eq!(provider.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(provider.timeout, Duration::from_secs(60));
     }
 
     #[test]
