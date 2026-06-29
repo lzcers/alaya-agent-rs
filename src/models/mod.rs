@@ -27,6 +27,21 @@ pub enum ChatError {
     ModelNotFound(String),
 }
 
+pub fn format_chat_error(error: &ChatError) -> String {
+    let mut details = error.to_string();
+    let mut source = std::error::Error::source(error);
+    let mut index = 1;
+
+    while let Some(error) = source {
+        details.push_str(&format!("; caused by #{index}: {error}"));
+        source = error.source();
+        index += 1;
+    }
+
+    details.push_str(&format!("; debug: {error:?}"));
+    details
+}
+
 /// 聊天流式响应片段
 #[derive(Debug, Clone)]
 pub struct ChatChunk {
@@ -91,4 +106,24 @@ pub struct GenAudioResponse {
 pub trait GenAudioCapability {
     /// 生成音频
     async fn gen_audio(&self, msgs: Vec<Message>) -> Result<GenAudioResponse, ChatError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatError, format_chat_error};
+    use crate::providers::ProviderError;
+
+    #[test]
+    fn format_chat_error_includes_error_chain_and_debug_details() {
+        let serialization_error = serde_json::from_str::<serde_json::Value>("not-json")
+            .expect_err("invalid JSON should fail");
+        let error = ChatError::Provider(ProviderError::Serialization(serialization_error));
+
+        let details = format_chat_error(&error);
+
+        assert!(details.contains("Provider error: Serialization error:"));
+        assert!(details.contains("caused by #1: Serialization error:"));
+        assert!(details.contains("caused by #2: expected ident"));
+        assert!(details.contains("debug: Provider(Serialization("));
+    }
 }

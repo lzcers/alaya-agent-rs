@@ -3,6 +3,7 @@ use futures::{StreamExt, stream::BoxStream};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::info;
 
 use super::{Provider, ProviderError, Request, Response, StreamResponse, parse_api_error};
 
@@ -140,6 +141,21 @@ impl Provider for OpenAICompatibleProvider {
     async fn chat(&self, request: Request) -> Result<Response, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
         let headers = self.build_headers();
+        let proxy_url = self.proxy_url.as_deref().unwrap_or("<none>");
+        let modalities = request
+            .extra
+            .get("modalities")
+            .map_or_else(|| "<none>".to_string(), ToString::to_string);
+        info!(
+            provider = %self.name,
+            model = %request.model,
+            stream = false,
+            modalities = %modalities,
+            url = %url,
+            proxy_configured = self.proxy_url.is_some(),
+            proxy_url = %proxy_url,
+            "sending provider chat request"
+        );
 
         let response = self
             .client
@@ -167,6 +183,21 @@ impl Provider for OpenAICompatibleProvider {
     ) -> Result<BoxStream<'static, StreamResponse>, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
         let headers = self.build_headers();
+        let proxy_url = self.proxy_url.as_deref().unwrap_or("<none>");
+        let modalities = request
+            .extra
+            .get("modalities")
+            .map_or_else(|| "<none>".to_string(), ToString::to_string);
+        info!(
+            provider = %self.name,
+            model = %request.model,
+            stream = true,
+            modalities = %modalities,
+            url = %url,
+            proxy_configured = self.proxy_url.is_some(),
+            proxy_url = %proxy_url,
+            "sending provider chat request"
+        );
 
         let mut stream_request = request;
         stream_request.stream = Some(true);

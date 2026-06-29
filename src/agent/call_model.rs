@@ -1,6 +1,6 @@
 use crate::agent::{ToolCall, ToolDef, ToolExecutor};
 use crate::core::{Message, Usage};
-use crate::models::ChatCapability;
+use crate::models::{ChatCapability, format_chat_error};
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -64,7 +64,7 @@ pub fn call_model(
         {
             Ok(s) => s,
             Err(e) => {
-                yield CallModelEvent::Error(e.to_string());
+                yield CallModelEvent::Error(format_chat_error(&e));
                 return;
             }
         };
