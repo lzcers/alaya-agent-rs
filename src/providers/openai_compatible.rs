@@ -108,20 +108,41 @@ fn build_http_client(timeout: Duration, proxy_url: Option<&str>) -> reqwest::Cli
     builder.build().expect("Failed to build HTTP client")
 }
 
-fn drain_sse_frames(buffer: &mut String) -> Vec<String> {
+fn normalize_crlf(buffer: &mut Vec<u8>) {
+    let mut read = 0;
+    let mut write = 0;
+
+    while read < buffer.len() {
+        if buffer[read] == b'\r' && buffer.get(read + 1) == Some(&b'\n') {
+            buffer[write] = b'\n';
+            read += 2;
+        } else {
+            buffer[write] = buffer[read];
+            read += 1;
+        }
+        write += 1;
+    }
+
+    buffer.truncate(write);
+}
+
+fn drain_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    normalize_crlf(buffer);
+
     let mut frames = Vec::new();
-    while let Some(idx) = buffer.find("\n\n") {
-        let frame = buffer[..idx].to_string();
-        let remaining = buffer[idx + 2..].to_string();
-        *buffer = remaining;
-        if !frame.trim().is_empty() {
+    while let Some(idx) = buffer.windows(2).position(|window| window == b"\n\n") {
+        let remaining = buffer.split_off(idx + 2);
+        buffer.truncate(idx);
+        let frame = std::mem::replace(buffer, remaining);
+        if frame.iter().any(|byte| !byte.is_ascii_whitespace()) {
             frames.push(frame);
         }
     }
     frames
 }
 
-fn parse_sse_frame(frame: &str) -> Option<StreamResponse> {
+fn parse_sse_frame(frame: &[u8]) -> Option<StreamResponse> {
+    let frame = std::str::from_utf8(frame).ok()?;
     let payload = frame
         .lines()
         .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
@@ -218,16 +239,13 @@ impl Provider for OpenAICompatibleProvider {
 
         let stream = response
             .bytes_stream()
-            .scan(String::new(), |buffer, chunk_result| {
+            .scan(Vec::new(), |buffer, chunk_result| {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(_) => return futures::future::ready(Some(vec![])),
                 };
 
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                if buffer.contains("\r\n") {
-                    *buffer = buffer.replace("\r\n", "\n");
-                }
+                buffer.extend_from_slice(&chunk);
 
                 let parsed = drain_sse_frames(buffer)
                     .into_iter()
@@ -301,11 +319,11 @@ mod tests {
 
     #[test]
     fn test_drain_sse_frames_handles_split_chunks() {
-        let mut buffer = String::new();
-        buffer.push_str("data: {\"id\":\"abc\"");
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"data: {\"id\":\"abc\"");
         assert!(drain_sse_frames(&mut buffer).is_empty());
 
-        buffer.push_str(",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"system_fingerprint\":null,\"choices\":[],\"usage\":null}\n\n");
+        buffer.extend_from_slice(b",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"system_fingerprint\":null,\"choices\":[],\"usage\":null}\n\n");
         let frames = drain_sse_frames(&mut buffer);
 
         assert_eq!(frames.len(), 1);
@@ -313,8 +331,46 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_frame_preserves_multibyte_content_across_every_chunk_boundary() {
+        let frame = format!(
+            "data: {}\r\n\r\n",
+            json!({
+                "id": "abc",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "test-model",
+                "system_fingerprint": null,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "铜片🙂" },
+                    "finish_reason": null
+                }],
+                "usage": null
+            })
+        );
+
+        for split_at in 0..=frame.len() {
+            let mut buffer = Vec::new();
+            buffer.extend_from_slice(&frame.as_bytes()[..split_at]);
+            let mut frames = drain_sse_frames(&mut buffer);
+
+            buffer.extend_from_slice(&frame.as_bytes()[split_at..]);
+            frames.extend(drain_sse_frames(&mut buffer));
+
+            assert_eq!(frames.len(), 1, "split_at={split_at}");
+            let parsed = parse_sse_frame(&frames[0]).expect("frame should parse");
+            assert_eq!(
+                parsed.choices[0].delta.content.as_deref(),
+                Some("铜片🙂"),
+                "split_at={split_at}"
+            );
+            assert!(buffer.is_empty(), "split_at={split_at}");
+        }
+    }
+
+    #[test]
     fn test_parse_sse_frame_ignores_done_and_parses_json() {
-        assert!(parse_sse_frame("data: [DONE]").is_none());
+        assert!(parse_sse_frame(b"data: [DONE]").is_none());
 
         let frame = format!(
             "data: {}\n",
@@ -333,7 +389,7 @@ mod tests {
             })
         );
 
-        let parsed = parse_sse_frame(&frame).expect("frame should parse");
+        let parsed = parse_sse_frame(frame.as_bytes()).expect("frame should parse");
         assert_eq!(parsed.choices.len(), 1);
         assert_eq!(parsed.choices[0].delta.content.as_deref(), Some("hi"));
         assert_eq!(parsed.choices[0].finish_reason.as_deref(), Some("stop"));
