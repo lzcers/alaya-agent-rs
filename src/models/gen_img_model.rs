@@ -3,10 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     core::Message,
     models::{ChatError, GenImgCapability, GenImgResponse},
-    providers::{Provider, Request, Response},
+    providers::{GeneratedImage, ImageGenerationRequest, Provider},
 };
 use async_trait::async_trait;
-use serde_json::json;
 
 pub struct GenImgModel {
     model_providers: HashMap<String, Arc<dyn Provider>>,
@@ -82,33 +81,26 @@ impl GenImgCapability for GenImgModel {
 
         let provider = self.get_provider(model_name)?;
 
-        let mut extra = std::collections::HashMap::new();
-        extra.insert("modalities".to_string(), json!(["image"]));
-        extra.insert(
-            "image_config".to_string(),
-            json!({
-                "aspect_ratio": self.aspect_ratio,
-                "image_size": self.image_size
-            }),
-        );
-
-        let mut request = Request::new(model_name, msgs);
-        request.extra = extra;
-
-        let response: Response = provider.chat(request).await?;
-
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or(ChatError::NoResponse)?;
-
-        let mut image_urls = Vec::new();
-        if let Some(images) = choice.message.images {
-            for img in images {
-                image_urls.push(img.image_url.url);
-            }
+        let prompt = msgs
+            .iter()
+            .map(Message::content)
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if prompt.is_empty() {
+            return Err(ChatError::NoResponse);
         }
+
+        let request = ImageGenerationRequest::new(model_name, prompt)
+            .with_resolution(&self.image_size)
+            .with_aspect_ratio(&self.aspect_ratio);
+        let response = provider.generate_image(request).await?;
+        let image_urls = response
+            .data
+            .into_iter()
+            .filter_map(generated_image_to_url)
+            .collect::<Vec<_>>();
 
         if image_urls.is_empty() {
             return Err(ChatError::NoResponse);
@@ -118,11 +110,98 @@ impl GenImgCapability for GenImgModel {
     }
 }
 
+fn generated_image_to_url(image: GeneratedImage) -> Option<String> {
+    if let Some(url) = image.url.filter(|url| !url.trim().is_empty()) {
+        return Some(url);
+    }
+
+    let encoded = image.b64_json.filter(|value| !value.trim().is_empty())?;
+    let media_type = image
+        .media_type
+        .filter(|value| value.starts_with("image/"))
+        .unwrap_or_else(|| "image/png".to_string());
+    Some(format!("data:{media_type};base64,{encoded}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::Message;
-    use crate::providers::{openrouter_provider, openrouter_provider_from_env};
+    use crate::providers::{
+        ImageGenerationResponse, ProviderError, Request, Response, StreamResponse,
+        openrouter_provider, openrouter_provider_from_env,
+    };
+    use futures::stream::{self, BoxStream};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockImageProvider {
+        requests: Mutex<Vec<ImageGenerationRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for MockImageProvider {
+        async fn chat(&self, _request: Request) -> Result<Response, ProviderError> {
+            Err(ProviderError::ApiError {
+                code: 400,
+                message: "chat is not used by GenImgModel".to_string(),
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: Request,
+        ) -> Result<BoxStream<'static, StreamResponse>, ProviderError> {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        async fn generate_image(
+            &self,
+            request: ImageGenerationRequest,
+        ) -> Result<ImageGenerationResponse, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(ImageGenerationResponse {
+                data: vec![GeneratedImage {
+                    b64_json: Some("aW1hZ2U=".to_string()),
+                    url: None,
+                    media_type: Some("image/webp".to_string()),
+                }],
+            })
+        }
+
+        fn name(&self) -> &str {
+            "mock-image"
+        }
+    }
+
+    #[tokio::test]
+    async fn gen_img_builds_dedicated_image_request_and_returns_data_url() {
+        let provider = Arc::new(MockImageProvider::default());
+        let mut model = GenImgModel::new()
+            .with_aspect_ratio("16:9".to_string())
+            .with_image_size("1K".to_string());
+        model.add_model_provider("krea/krea-2-medium-turbo", provider.clone());
+        model.set_active_model("krea/krea-2-medium-turbo").unwrap();
+
+        let response = model
+            .gen_img(vec![
+                Message::system("visual direction"),
+                Message::user("cinematic landscape"),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(response.image_urls, vec!["data:image/webp;base64,aW1hZ2U="]);
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "krea/krea-2-medium-turbo");
+        assert_eq!(
+            requests[0].prompt,
+            "visual direction\n\ncinematic landscape"
+        );
+        assert_eq!(requests[0].resolution.as_deref(), Some("1K"));
+        assert_eq!(requests[0].aspect_ratio.as_deref(), Some("16:9"));
+    }
 
     #[tokio::test]
     async fn test_gen_img_with_openrouter() {

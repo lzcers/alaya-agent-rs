@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::info;
 
-use super::{Provider, ProviderError, Request, Response, StreamResponse, parse_api_error};
+use super::{
+    ImageGenerationRequest, ImageGenerationResponse, Provider, ProviderError, Request, Response,
+    StreamResponse, parse_api_error,
+};
 
 /// OpenAI 兼容的 Provider 实现
 ///
@@ -259,6 +262,40 @@ impl Provider for OpenAICompatibleProvider {
         Ok(Box::pin(stream))
     }
 
+    async fn generate_image(
+        &self,
+        request: ImageGenerationRequest,
+    ) -> Result<ImageGenerationResponse, ProviderError> {
+        let url = format!("{}/images", self.base_url);
+        let headers = self.build_headers();
+        info!(
+            provider = %self.name,
+            model = %request.model,
+            resolution = request.resolution.as_deref().unwrap_or("<none>"),
+            aspect_ratio = request.aspect_ratio.as_deref().unwrap_or("<none>"),
+            url = %url,
+            proxy_configured = self.proxy_url.is_some(),
+            "sending provider image request"
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            return Err(parse_api_error(&body, status.as_u16()));
+        }
+
+        Ok(serde_json::from_str(&body)?)
+    }
+
     /// Provider 名称
     fn name(&self) -> &str {
         &self.name
@@ -269,6 +306,10 @@ impl Provider for OpenAICompatibleProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[test]
     fn test_provider_creation() {
@@ -393,5 +434,107 @@ mod tests {
         assert_eq!(parsed.choices.len(), 1);
         assert_eq!(parsed.choices[0].delta.content.as_deref(), Some("hi"));
         assert_eq!(parsed.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn image_generation_uses_dedicated_images_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        let response_body = json!({
+            "data": [{
+                "b64_json": "aW1hZ2U=",
+                "media_type": "image/png"
+            }]
+        })
+        .to_string();
+        let server = tokio::spawn(capture_one_request(listener, response_body));
+        let provider = OpenAICompatibleProvider::new(
+            "openrouter",
+            "test-api-key",
+            format!("http://{address}/api/v1"),
+        );
+
+        let response = provider
+            .generate_image(
+                ImageGenerationRequest::new("krea/krea-2-medium-turbo", "a cinematic landscape")
+                    .with_resolution("1K")
+                    .with_aspect_ratio("16:9"),
+            )
+            .await
+            .expect("image request should succeed");
+        let raw_request = server.await.expect("test server should complete");
+        let (headers, body) = raw_request
+            .split_once("\r\n\r\n")
+            .expect("request should contain headers and body");
+        let body: serde_json::Value =
+            serde_json::from_str(body).expect("request body should be JSON");
+
+        assert!(headers.starts_with("POST /api/v1/images HTTP/1.1"));
+        assert_eq!(body["model"], "krea/krea-2-medium-turbo");
+        assert_eq!(body["prompt"], "a cinematic landscape");
+        assert_eq!(body["resolution"], "1K");
+        assert_eq!(body["aspect_ratio"], "16:9");
+        assert!(body.get("messages").is_none());
+        assert!(body.get("modalities").is_none());
+        assert!(body.get("image_config").is_none());
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].b64_json.as_deref(), Some("aW1hZ2U="));
+    }
+
+    async fn capture_one_request(listener: TcpListener, response_body: String) -> String {
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .expect("test server should accept a connection");
+        let mut request = Vec::new();
+        let mut expected_len = None;
+
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let bytes_read = socket
+                .read(&mut chunk)
+                .await
+                .expect("test server should read request");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes_read]);
+
+            if expected_len.is_none()
+                && let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+            {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                expected_len = Some(header_end + 4 + content_length);
+            }
+
+            if expected_len.is_some_and(|length| request.len() >= length) {
+                break;
+            }
+        }
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("test server should write response");
+
+        String::from_utf8(request).expect("request should be UTF-8")
     }
 }

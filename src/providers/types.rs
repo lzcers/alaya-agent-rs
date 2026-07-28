@@ -86,6 +86,19 @@ pub trait Provider: Send + Sync {
         request: Request,
     ) -> Result<BoxStream<'static, StreamResponse>, ProviderError>;
 
+    /// 使用 Provider 的独立图片生成端点。
+    ///
+    /// 默认实现保持现有自定义 Provider 兼容；支持图片的 Provider 应覆盖此方法。
+    async fn generate_image(
+        &self,
+        _request: ImageGenerationRequest,
+    ) -> Result<ImageGenerationResponse, ProviderError> {
+        Err(ProviderError::ApiError {
+            code: 501,
+            message: "image generation is not supported by this provider".to_string(),
+        })
+    }
+
     /// Provider 名称（用于日志和调试）
     fn name(&self) -> &str;
 }
@@ -296,6 +309,57 @@ impl Request {
         );
         self
     }
+}
+
+// ============================================================================
+// 图片生成请求与响应
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenerationRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+}
+
+impl ImageGenerationRequest {
+    pub fn new(model: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            prompt: prompt.into(),
+            resolution: None,
+            aspect_ratio: None,
+        }
+    }
+
+    pub fn with_resolution(mut self, resolution: impl Into<String>) -> Self {
+        self.resolution = Some(resolution.into());
+        self
+    }
+
+    pub fn with_aspect_ratio(mut self, aspect_ratio: impl Into<String>) -> Self {
+        self.aspect_ratio = Some(aspect_ratio.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenerationResponse {
+    #[serde(default)]
+    pub data: Vec<GeneratedImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedImage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
 }
 
 // ============================================================================
