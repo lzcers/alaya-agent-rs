@@ -1,6 +1,6 @@
 use super::AgentActor;
 use crate::agent::{Context, ToolExecutor};
-use crate::models::ChatCapability;
+use crate::router::ChatCapability;
 
 /// Agent Actor 构建器
 pub struct AgentActorBuilder<C, E>

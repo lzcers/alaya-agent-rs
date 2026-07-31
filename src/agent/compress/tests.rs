@@ -10,7 +10,7 @@ use crate::agent::{
     Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall, ToolCallFunction,
 };
 use crate::core::Message;
-use crate::models::{ChatCapability, ChatChunk, ChatError};
+use crate::router::{ChatCapability, ChatChunk, RouterError};
 use futures::stream::{self, BoxStream};
 
 fn conversation_with_tools_and_reasoning() -> Vec<Message> {
@@ -100,7 +100,7 @@ struct StubSummaryModel;
 
 #[async_trait]
 impl SummaryModel for StubSummaryModel {
-    async fn summarize(&self, prompt: &str) -> Result<String, ChatError> {
+    async fn summarize(&self, prompt: &str) -> Result<String, RouterError> {
         assert!(prompt.contains("Open the config"));
         assert!(prompt.contains("assistant_tool_call: read_file"));
         Ok("Decided to inspect config first.\nNeed to revisit handlers.".to_string())
@@ -117,7 +117,7 @@ impl ChatCapability for StubChatModel {
         &self,
         msgs: Vec<Message>,
         _tools: Option<Vec<crate::agent::ToolDef>>,
-    ) -> Result<Message, ChatError> {
+    ) -> Result<Message, RouterError> {
         assert_eq!(msgs.len(), 2);
         assert!(matches!(msgs[0], Message::System { .. }));
         assert!(matches!(msgs[1], Message::User { .. }));
@@ -128,7 +128,7 @@ impl ChatCapability for StubChatModel {
         &self,
         _msgs: Vec<Message>,
         _tools: Option<Vec<crate::agent::ToolDef>>,
-    ) -> Result<BoxStream<'static, ChatChunk>, ChatError> {
+    ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
         Ok(Box::pin(stream::empty()))
     }
 }

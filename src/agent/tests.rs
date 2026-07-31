@@ -5,8 +5,8 @@ use crate::agent::{
 };
 
 use crate::core::{Message, Usage};
-use crate::models::{ChatCapability, ChatChunk, ChatError, ChatModel};
 use crate::providers::deepseek_provider_from_env;
+use crate::router::{ChatCapability, ChatChunk, ModelCapability, ModelRouter, RouterError};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use serde_json::Value;
@@ -94,7 +94,7 @@ impl ChatCapability for MockChatModel {
         &self,
         _msgs: Vec<Message>,
         _tools: Option<Vec<ToolDef>>,
-    ) -> Result<Message, ChatError> {
+    ) -> Result<Message, RouterError> {
         panic!("chat should not be called in this test");
     }
 
@@ -102,7 +102,7 @@ impl ChatCapability for MockChatModel {
         &self,
         _msgs: Vec<Message>,
         _tools: Option<Vec<ToolDef>>,
-    ) -> Result<BoxStream<'static, ChatChunk>, ChatError> {
+    ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
         Ok(Box::pin(stream::iter(self.chunks.clone())))
     }
 }
@@ -161,10 +161,10 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
         }
     };
 
-    // 2. 创建 ChatModel
-    let mut model = ChatModel::new();
-    model.add_model_provider("deepseek-reasoner", provider);
-    if let Err(e) = model.set_active_model("deepseek-reasoner") {
+    // 2. 创建 ModelRouter
+    let mut model = ModelRouter::new();
+    model.add_model_provider("deepseek-reasoner", provider, &[ModelCapability::Chat]);
+    if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-reasoner") {
         print_section("Setup Error");
         print_field("reason", e.to_string());
         return;

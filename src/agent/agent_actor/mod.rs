@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::{AgentState, Context, Metrics, ToolExecutor};
-use crate::models::ChatCapability;
+use crate::router::ChatCapability;
 
 pub use builder::AgentActorBuilder;
 pub use loop_control::LoopState;

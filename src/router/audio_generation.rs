@@ -1,82 +1,30 @@
-use std::{collections::HashMap, sync::Arc};
-
 use crate::{
     core::Message,
-    models::{ChatError, GenAudioCapability, GenAudioResponse},
-    providers::{Provider, Request},
+    providers::Request,
+    router::{ModelCapability, ModelRouter, RouterError},
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
-pub struct GenAudioModel {
-    model_providers: HashMap<String, Arc<dyn Provider>>,
-    active_model: Option<String>,
-    audio_format: String,
-    voice: Option<String>,
+#[derive(Debug, Clone)]
+pub struct GenAudioResponse {
+    pub audio_data: String,
+    pub transcript: String,
+    pub format: String,
 }
 
-impl Default for GenAudioModel {
-    fn default() -> Self {
-        Self::new()
-    }
+#[async_trait]
+pub trait GenAudioCapability {
+    async fn gen_audio(&self, msgs: Vec<Message>) -> Result<GenAudioResponse, RouterError>;
 }
 
-impl GenAudioModel {
-    pub fn new() -> Self {
-        Self {
-            model_providers: HashMap::new(),
-            active_model: None,
-            audio_format: "wav".to_string(),
-            voice: None,
-        }
-    }
-
-    pub fn add_model_provider(&mut self, model_name: &str, provider: Arc<dyn Provider>) {
-        self.model_providers
-            .entry(model_name.to_owned())
-            .or_insert(provider);
-    }
-
-    pub fn add_models_for_provider(&mut self, model_names: &[&str], provider: Arc<dyn Provider>) {
-        for model_name in model_names {
-            self.add_model_provider(model_name, provider.clone());
-        }
-    }
-
-    pub fn set_active_model(&mut self, model_name: &str) -> Result<(), ChatError> {
-        if !self.model_providers.contains_key(model_name) {
-            return Err(ChatError::ModelNotFound(model_name.to_owned()));
-        }
-        self.active_model = Some(model_name.to_owned());
-        Ok(())
-    }
-
-    pub fn with_audio_format(mut self, audio_format: String) -> Self {
-        self.audio_format = audio_format;
-        self
-    }
-
-    pub fn with_voice(mut self, voice: String) -> Self {
-        self.voice = Some(voice);
-        self
-    }
-
-    fn get_provider(&self, model_name: &str) -> Result<&Arc<dyn Provider>, ChatError> {
-        self.model_providers
-            .get(model_name)
-            .ok_or_else(|| ChatError::ModelNotFound(model_name.to_owned()))
-    }
-
-    pub fn active_model(&self) -> Option<&str> {
-        self.active_model.as_deref()
-    }
-
+impl ModelRouter {
     fn audio_config(&self) -> Value {
         let mut audio = Map::new();
-        audio.insert("format".to_string(), json!(self.audio_format));
+        audio.insert("format".to_string(), json!(self.audio_format()));
 
-        if let Some(voice) = &self.voice {
+        if let Some(voice) = self.voice() {
             audio.insert("voice".to_string(), json!(voice));
         }
 
@@ -85,14 +33,9 @@ impl GenAudioModel {
 }
 
 #[async_trait]
-impl GenAudioCapability for GenAudioModel {
-    async fn gen_audio(&self, msgs: Vec<Message>) -> Result<GenAudioResponse, ChatError> {
-        let model_name = self
-            .active_model
-            .as_ref()
-            .ok_or_else(|| ChatError::ModelNotFound("No active model set".to_string()))?;
-
-        let provider = self.get_provider(model_name)?;
+impl GenAudioCapability for ModelRouter {
+    async fn gen_audio(&self, msgs: Vec<Message>) -> Result<GenAudioResponse, RouterError> {
+        let (model_name, provider) = self.route(ModelCapability::Audio)?;
 
         let mut extra = std::collections::HashMap::new();
         extra.insert("modalities".to_string(), json!(["text", "audio"]));
@@ -119,13 +62,13 @@ impl GenAudioCapability for GenAudioModel {
         }
 
         if audio_data.is_empty() {
-            return Err(ChatError::NoResponse);
+            return Err(RouterError::NoResponse);
         }
 
         Ok(GenAudioResponse {
             audio_data,
             transcript,
-            format: self.audio_format.clone(),
+            format: self.audio_format().to_string(),
         })
     }
 }
@@ -134,10 +77,11 @@ impl GenAudioCapability for GenAudioModel {
 mod tests {
     use super::*;
     use crate::providers::{
-        ChoiceAudio, Delta, ProviderError, StreamChoice, StreamResponse, openrouter_provider,
-        openrouter_provider_from_env,
+        ChoiceAudio, Delta, Provider, ProviderError, StreamChoice, StreamResponse,
+        openrouter_provider, openrouter_provider_from_env,
     };
     use futures::stream::{self, BoxStream};
+    use std::sync::Arc;
 
     struct MockAudioProvider;
 
@@ -149,7 +93,7 @@ mod tests {
         ) -> Result<crate::providers::Response, ProviderError> {
             Err(ProviderError::ApiError {
                 code: 400,
-                message: "chat is not used by GenAudioModel".to_string(),
+                message: "chat is not used by the audio capability".to_string(),
             })
         }
 
@@ -206,10 +150,14 @@ mod tests {
     #[tokio::test]
     async fn test_gen_audio_collects_streamed_audio_chunks() {
         let provider = Arc::new(MockAudioProvider);
-        let mut model = GenAudioModel::new();
-        model.add_model_provider("google/lyria-3-clip-preview", provider);
+        let mut model = ModelRouter::new();
+        model.add_model_provider(
+            "google/lyria-3-clip-preview",
+            provider,
+            &[ModelCapability::Audio],
+        );
         model
-            .set_active_model("google/lyria-3-clip-preview")
+            .set_active_model(ModelCapability::Audio, "google/lyria-3-clip-preview")
             .unwrap();
 
         let response = model
@@ -235,10 +183,16 @@ mod tests {
             }
         };
 
-        let mut model = GenAudioModel::new().with_audio_format("wav".to_string());
-        model.add_model_provider("google/lyria-3-clip-preview", provider);
+        let mut model = ModelRouter::new().with_audio_format("wav".to_string());
+        model.add_model_provider(
+            "google/lyria-3-clip-preview",
+            provider,
+            &[ModelCapability::Audio],
+        );
 
-        if let Err(e) = model.set_active_model("google/lyria-3-clip-preview") {
+        if let Err(e) =
+            model.set_active_model(ModelCapability::Audio, "google/lyria-3-clip-preview")
+        {
             eprintln!("Failed to set active model: {}", e);
             return;
         }
@@ -269,52 +223,48 @@ mod tests {
     fn test_model_provider_mapping() {
         let or_provider = Arc::new(openrouter_provider("dummy_key"));
 
-        let mut model = GenAudioModel::new();
+        let mut model = ModelRouter::new();
 
         model.add_models_for_provider(
             &["google/lyria-3-clip-preview", "google/lyria-3-pro-preview"],
             or_provider,
+            &[ModelCapability::Audio],
         );
 
-        assert!(
-            model
-                .model_providers
-                .contains_key("google/lyria-3-clip-preview")
-        );
-        assert!(
-            model
-                .model_providers
-                .contains_key("google/lyria-3-pro-preview")
-        );
-        assert_eq!(model.model_providers.len(), 2);
+        assert!(model.supports("google/lyria-3-clip-preview", ModelCapability::Audio));
+        assert!(model.supports("google/lyria-3-pro-preview", ModelCapability::Audio));
     }
 
     #[test]
     fn test_set_active_model() {
         let provider = Arc::new(openrouter_provider("dummy_key"));
-        let mut model = GenAudioModel::new();
-        model.add_model_provider("google/lyria-3-clip-preview", provider);
-
-        let result = model.set_active_model("google/lyria-3-clip-preview");
-        assert!(result.is_ok());
-        assert_eq!(
-            model.active_model,
-            Some("google/lyria-3-clip-preview".to_string())
+        let mut model = ModelRouter::new();
+        model.add_model_provider(
+            "google/lyria-3-clip-preview",
+            provider,
+            &[ModelCapability::Audio],
         );
 
-        let result = model.set_active_model("non-existent-model");
+        let result = model.set_active_model(ModelCapability::Audio, "google/lyria-3-clip-preview");
+        assert!(result.is_ok());
+        assert_eq!(
+            model.active_model(ModelCapability::Audio),
+            Some("google/lyria-3-clip-preview")
+        );
+
+        let result = model.set_active_model(ModelCapability::Audio, "non-existent-model");
         assert!(result.is_err());
-        assert!(matches!(result, Err(ChatError::ModelNotFound(_))));
+        assert!(matches!(result, Err(RouterError::ModelNotFound(_))));
     }
 
     #[test]
     fn test_builder_methods() {
-        let model = GenAudioModel::new()
+        let model = ModelRouter::new()
             .with_audio_format("mp3".to_string())
             .with_voice("alloy".to_string());
 
-        assert_eq!(model.audio_format, "mp3");
-        assert_eq!(model.voice, Some("alloy".to_string()));
+        assert_eq!(model.audio_format(), "mp3");
+        assert_eq!(model.voice(), Some("alloy"));
         assert_eq!(
             model.audio_config(),
             json!({ "format": "mp3", "voice": "alloy" })

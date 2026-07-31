@@ -7,7 +7,7 @@ use super::{AgentActor, AgentActorCommand, AgentActorEvent, AgentActorHandle, St
 use crate::agent::agent_actor::lifecycle::StepFrame;
 use crate::agent::{AgentError, AgentTerminalReason, JobState, ToolExecutor};
 use crate::core::Message;
-use crate::models::ChatCapability;
+use crate::router::ChatCapability;
 
 #[derive(Clone)]
 pub enum LoopState {

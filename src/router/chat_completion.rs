@@ -1,99 +1,54 @@
-use std::{collections::HashMap, sync::Arc};
-
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 
 use crate::{
-    agent::ToolDef,
-    core::{Message, MessageRole},
-    models::{ChatCapability, ChatChunk, ChatError},
-    providers::{Provider, Request, Response},
+    agent::{ToolCall, ToolDef},
+    core::{Message, MessageRole, Usage},
+    providers::{Request, Response},
+    router::{ModelCapability, ModelRouter, RouterError},
 };
 
-#[derive(Clone)]
-pub struct ChatModel {
-    model_providers: HashMap<String, Arc<dyn Provider>>,
-    active_model: Option<String>,
-    output_json: bool,
-    reasoning_effort: Option<String>,
-    thinking_enabled: Option<bool>,
-}
-
-impl Default for ChatModel {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ChatModel {
-    pub fn new() -> Self {
-        Self {
-            model_providers: HashMap::new(),
-            active_model: None,
-            output_json: false,
-            reasoning_effort: None,
-            thinking_enabled: None,
-        }
-    }
-
-    pub fn add_model_provider(&mut self, model_name: &str, provider: Arc<dyn Provider>) {
-        self.model_providers
-            .entry(model_name.to_owned())
-            .or_insert(provider);
-    }
-
-    pub fn add_models_for_provider(&mut self, model_names: &[&str], provider: Arc<dyn Provider>) {
-        for model_name in model_names {
-            self.add_model_provider(model_name, provider.clone());
-        }
-    }
-
-    pub fn set_active_model(&mut self, model_name: &str) -> Result<(), ChatError> {
-        if !self.model_providers.contains_key(model_name) {
-            return Err(ChatError::ModelNotFound(model_name.to_owned()));
-        }
-        self.active_model = Some(model_name.to_owned());
-        Ok(())
-    }
-
-    pub fn get_provider(&self, model_name: &str) -> Result<&Arc<dyn Provider>, ChatError> {
-        self.model_providers
-            .get(model_name)
-            .ok_or_else(|| ChatError::ModelNotFound(model_name.to_owned()))
-    }
-    pub fn set_output_json(&mut self, output_json: bool) {
-        self.output_json = output_json;
-    }
-
-    pub fn set_reasoning_effort(&mut self, reasoning_effort: impl Into<String>) {
-        self.reasoning_effort = Some(reasoning_effort.into());
-    }
-
-    pub fn set_thinking_enabled(&mut self, enabled: bool) {
-        self.thinking_enabled = Some(enabled);
-    }
+/// A streamed chat response chunk.
+#[derive(Debug, Clone)]
+pub struct ChatChunk {
+    pub content: String,
+    pub reasoning_content: String,
+    pub is_finished: bool,
+    pub finish_reason: Option<String>,
+    pub tool_calls: Option<Vec<ToolCall>>,
+    pub usage: Option<Usage>,
 }
 
 #[async_trait]
-impl ChatCapability for ChatModel {
+pub trait ChatCapability {
+    async fn chat(
+        &self,
+        msgs: Vec<Message>,
+        tools: Option<Vec<ToolDef>>,
+    ) -> Result<Message, RouterError>;
+
+    async fn chat_stream(
+        &self,
+        msgs: Vec<Message>,
+        tools: Option<Vec<ToolDef>>,
+    ) -> Result<BoxStream<'static, ChatChunk>, RouterError>;
+}
+
+#[async_trait]
+impl ChatCapability for ModelRouter {
     async fn chat(
         &self,
         msg: Vec<Message>,
         tools: Option<Vec<ToolDef>>,
-    ) -> Result<Message, ChatError> {
-        let model_name = self
-            .active_model
-            .as_ref()
-            .ok_or_else(|| ChatError::ModelNotFound("No active model set".to_string()))?;
-
-        let provider = self.get_provider(model_name)?;
+    ) -> Result<Message, RouterError> {
+        let (model_name, provider) = self.route(ModelCapability::Chat)?;
         let mut request = Request::new(model_name, msg).with_tools(tools);
 
-        if let Some(reasoning_effort) = &self.reasoning_effort {
-            request = request.with_reasoning_effort(reasoning_effort.clone());
+        if let Some(reasoning_effort) = self.reasoning_effort() {
+            request = request.with_reasoning_effort(reasoning_effort);
         }
 
-        if let Some(enabled) = self.thinking_enabled {
+        if let Some(enabled) = self.thinking_enabled() {
             request = request.with_thinking(enabled);
         }
 
@@ -103,7 +58,7 @@ impl ChatCapability for ChatModel {
             .choices
             .into_iter()
             .next()
-            .ok_or(ChatError::NoResponse)?;
+            .ok_or(RouterError::NoResponse)?;
 
         match choice.message.role {
             MessageRole::Assistant => Ok(Message::Assistant {
@@ -128,27 +83,22 @@ impl ChatCapability for ChatModel {
         &self,
         msgs: Vec<Message>,
         tools: Option<Vec<ToolDef>>,
-    ) -> Result<BoxStream<'static, ChatChunk>, ChatError> {
-        let model_name = self
-            .active_model
-            .as_ref()
-            .ok_or_else(|| ChatError::ModelNotFound("No active model set".to_string()))?;
-
-        let provider = self.get_provider(model_name)?;
+    ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
+        let (model_name, provider) = self.route(ModelCapability::Chat)?;
         let mut request = Request::new(model_name, msgs)
             .with_stream(true)
             .with_stream_usage(true)
             .with_tools(tools);
 
-        if self.output_json {
+        if self.output_json() {
             request = request.with_response_format_json();
         }
 
-        if let Some(reasoning_effort) = &self.reasoning_effort {
-            request = request.with_reasoning_effort(reasoning_effort.clone());
+        if let Some(reasoning_effort) = self.reasoning_effort() {
+            request = request.with_reasoning_effort(reasoning_effort);
         }
 
-        if let Some(enabled) = self.thinking_enabled {
+        if let Some(enabled) = self.thinking_enabled() {
             request = request.with_thinking(enabled);
         }
 
@@ -192,6 +142,7 @@ mod tests {
         deepseek_provider, deepseek_provider_from_env, openrouter_provider,
         openrouter_provider_from_env,
     };
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_chat_with_deepseek_chat() {
@@ -205,10 +156,14 @@ mod tests {
             }
         };
 
-        let mut model = ChatModel::new();
-        model.add_models_for_provider(&["deepseek-chat", "deepseek-reasoner"], provider);
+        let mut model = ModelRouter::new();
+        model.add_models_for_provider(
+            &["deepseek-chat", "deepseek-reasoner"],
+            provider,
+            &[ModelCapability::Chat],
+        );
 
-        if let Err(e) = model.set_active_model("deepseek-chat") {
+        if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-chat") {
             eprintln!("Failed to set active model: {}", e);
             return;
         }
@@ -239,10 +194,14 @@ mod tests {
             }
         };
 
-        let mut model = ChatModel::new();
-        model.add_models_for_provider(&["deepseek-chat", "deepseek-reasoner"], provider);
+        let mut model = ModelRouter::new();
+        model.add_models_for_provider(
+            &["deepseek-chat", "deepseek-reasoner"],
+            provider,
+            &[ModelCapability::Chat],
+        );
 
-        if let Err(e) = model.set_active_model("deepseek-chat") {
+        if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-chat") {
             eprintln!("Failed to set active model: {}", e);
             return;
         }
@@ -278,10 +237,14 @@ mod tests {
             }
         };
 
-        let mut model = ChatModel::new();
-        model.add_models_for_provider(&["deepseek-chat", "deepseek-reasoner"], provider);
+        let mut model = ModelRouter::new();
+        model.add_models_for_provider(
+            &["deepseek-chat", "deepseek-reasoner"],
+            provider,
+            &[ModelCapability::Chat],
+        );
 
-        if let Err(e) = model.set_active_model("deepseek-reasoner") {
+        if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-reasoner") {
             eprintln!("Failed to set active model: {}", e);
             return;
         }
@@ -322,10 +285,14 @@ mod tests {
             }
         };
 
-        let mut model = ChatModel::new();
-        model.add_models_for_provider(&["deepseek-chat", "deepseek-reasoner"], provider);
+        let mut model = ModelRouter::new();
+        model.add_models_for_provider(
+            &["deepseek-chat", "deepseek-reasoner"],
+            provider,
+            &[ModelCapability::Chat],
+        );
 
-        if let Err(e) = model.set_active_model("deepseek-reasoner") {
+        if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-reasoner") {
             eprintln!("Failed to set active model: {}", e);
             return;
         }
@@ -371,10 +338,15 @@ mod tests {
             }
         };
 
-        let mut model = ChatModel::new();
-        model.add_model_provider("google/gemini-3-pro-preview", provider);
+        let mut model = ModelRouter::new();
+        model.add_model_provider(
+            "google/gemini-3-pro-preview",
+            provider,
+            &[ModelCapability::Chat],
+        );
 
-        if let Err(e) = model.set_active_model("google/gemini-3-pro-preview") {
+        if let Err(e) = model.set_active_model(ModelCapability::Chat, "google/gemini-3-pro-preview")
+        {
             eprintln!("Failed to set active model: {}", e);
             return;
         }
@@ -405,10 +377,15 @@ mod tests {
             }
         };
 
-        let mut model = ChatModel::new();
-        model.add_model_provider("google/gemini-3-pro-preview", provider);
+        let mut model = ModelRouter::new();
+        model.add_model_provider(
+            "google/gemini-3-pro-preview",
+            provider,
+            &[ModelCapability::Chat],
+        );
 
-        if let Err(e) = model.set_active_model("google/gemini-3-pro-preview") {
+        if let Err(e) = model.set_active_model(ModelCapability::Chat, "google/gemini-3-pro-preview")
+        {
             eprintln!("Failed to set active model: {}", e);
             return;
         }
@@ -437,44 +414,50 @@ mod tests {
         let ds_provider = Arc::new(deepseek_provider("dummy_key"));
         let or_provider = Arc::new(openrouter_provider("dummy_key"));
 
-        let mut model = ChatModel::new();
+        let mut model = ModelRouter::new();
 
-        model.add_models_for_provider(&["deepseek-chat", "deepseek-reasoner"], ds_provider);
-        model.add_model_provider("google/gemini-3-pro-preview", or_provider);
-
-        assert!(model.model_providers.contains_key("deepseek-chat"));
-        assert!(model.model_providers.contains_key("deepseek-reasoner"));
-        assert!(
-            model
-                .model_providers
-                .contains_key("google/gemini-3-pro-preview")
+        model.add_models_for_provider(
+            &["deepseek-chat", "deepseek-reasoner"],
+            ds_provider,
+            &[ModelCapability::Chat],
         );
-        assert_eq!(model.model_providers.len(), 3);
+        model.add_model_provider(
+            "google/gemini-3-pro-preview",
+            or_provider,
+            &[ModelCapability::Chat],
+        );
+
+        assert!(model.supports("deepseek-chat", ModelCapability::Chat));
+        assert!(model.supports("deepseek-reasoner", ModelCapability::Chat));
+        assert!(model.supports("google/gemini-3-pro-preview", ModelCapability::Chat));
     }
 
     #[test]
     fn test_set_active_model() {
         let provider = Arc::new(deepseek_provider("dummy_key"));
-        let mut model = ChatModel::new();
-        model.add_model_provider("deepseek-chat", provider);
+        let mut model = ModelRouter::new();
+        model.add_model_provider("deepseek-chat", provider, &[ModelCapability::Chat]);
 
-        let result = model.set_active_model("deepseek-chat");
+        let result = model.set_active_model(ModelCapability::Chat, "deepseek-chat");
         assert!(result.is_ok());
-        assert_eq!(model.active_model, Some("deepseek-chat".to_string()));
+        assert_eq!(
+            model.active_model(ModelCapability::Chat),
+            Some("deepseek-chat")
+        );
 
-        let result = model.set_active_model("non-existent-model");
+        let result = model.set_active_model(ModelCapability::Chat, "non-existent-model");
         assert!(result.is_err());
-        assert!(matches!(result, Err(ChatError::ModelNotFound(_))));
+        assert!(matches!(result, Err(RouterError::ModelNotFound(_))));
     }
 
     #[test]
     fn test_set_reasoning_options() {
-        let mut model = ChatModel::new();
+        let mut model = ModelRouter::new();
 
         model.set_reasoning_effort("high");
         model.set_thinking_enabled(true);
 
-        assert_eq!(model.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(model.thinking_enabled, Some(true));
+        assert_eq!(model.reasoning_effort(), Some("high"));
+        assert_eq!(model.thinking_enabled(), Some(true));
     }
 }

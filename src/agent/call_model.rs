@@ -1,6 +1,6 @@
 use crate::agent::{ToolCall, ToolDef, ToolExecutor};
 use crate::core::{Message, Usage};
-use crate::models::{ChatCapability, format_chat_error};
+use crate::router::{ChatCapability, format_router_error};
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -64,7 +64,7 @@ pub fn call_model(
         {
             Ok(s) => s,
             Err(e) => {
-                yield CallModelEvent::Error(format_chat_error(&e));
+                yield CallModelEvent::Error(format_router_error(&e));
                 return;
             }
         };
@@ -212,7 +212,7 @@ fn merge_tool_calls(accumulated: &mut Vec<ToolCall>, incremental: Vec<ToolCall>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ChatChunk, ChatError};
+    use crate::router::{ChatChunk, RouterError};
     use async_trait::async_trait;
     use futures::{StreamExt, stream, stream::BoxStream};
 
@@ -226,7 +226,7 @@ mod tests {
             &self,
             _msgs: Vec<Message>,
             _tools: Option<Vec<ToolDef>>,
-        ) -> Result<Message, ChatError> {
+        ) -> Result<Message, RouterError> {
             panic!("chat should not be called in this test");
         }
 
@@ -234,7 +234,7 @@ mod tests {
             &self,
             _msgs: Vec<Message>,
             _tools: Option<Vec<ToolDef>>,
-        ) -> Result<BoxStream<'static, ChatChunk>, ChatError> {
+        ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
             Ok(Box::pin(stream::iter(self.chunks.clone())))
         }
     }
