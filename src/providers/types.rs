@@ -1,5 +1,5 @@
+use crate::MessageRole;
 use crate::agent::{ToolCall, ToolDef};
-use crate::core::MessageRole;
 use serde::de::{self, Unexpected};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -206,7 +206,7 @@ pub struct Request {
     /// 模型名称
     pub model: String,
     /// 消息列表
-    pub messages: Vec<crate::core::Message>,
+    pub messages: Vec<crate::Message>,
     /// 是否使用流式输出
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
@@ -222,7 +222,7 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn new(model: impl Into<String>, messages: Vec<crate::core::Message>) -> Self {
+    pub fn new(model: impl Into<String>, messages: Vec<crate::Message>) -> Self {
         Self {
             model: model.into(),
             messages,
@@ -475,7 +475,7 @@ pub struct StreamResponse {
 #[cfg(test)]
 mod tests {
     use super::{Request, Response, StreamResponse};
-    use crate::core::Message;
+    use crate::Message;
     use serde_json::json;
 
     #[test]

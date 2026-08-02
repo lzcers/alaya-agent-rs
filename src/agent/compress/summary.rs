@@ -4,8 +4,8 @@ use super::conversation::{
     conversation_messages, primary_conversation_layer_index, split_by_user_turns,
 };
 use super::{CompressionError, ModelCompression, SummaryModel};
+use crate::Message;
 use crate::agent::{Context, Layer, LayerKind};
-use crate::core::Message;
 
 const DEFAULT_SUMMARIZE_INSTRUCTION: &str = "Preserve key decisions, constraints, pending work, and unresolved questions. Discard repetitive exploration and raw tool output unless it changes the state of the task.";
 const DEFAULT_SUMMARY_LAYER_TAG: &str = "compressed_summary";

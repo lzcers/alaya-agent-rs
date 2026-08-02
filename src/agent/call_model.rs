@@ -1,6 +1,6 @@
 use crate::agent::{ToolCall, ToolDef, ToolExecutor};
-use crate::core::{Message, Usage};
 use crate::router::{ChatCapability, format_router_error};
+use crate::{Message, Usage};
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};

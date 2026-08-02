@@ -1,8 +1,8 @@
 use serde_json::Value;
 
 use super::CompressionError;
+use crate::Message;
 use crate::agent::{Context, Layer, LayerKind};
-use crate::core::Message;
 
 pub(super) fn primary_conversation_layer_index(context: &Context) -> Option<usize> {
     context

@@ -4,9 +4,9 @@ use tokio::sync::mpsc;
 
 use super::lifecycle::{LifeCycleFlow, LifeCycleInterrupt, LifeCycleResult, StepLifeCycle};
 use super::{AgentActor, AgentActorCommand, AgentActorEvent, AgentActorHandle, StepResult};
+use crate::Message;
 use crate::agent::agent_actor::lifecycle::StepFrame;
 use crate::agent::{AgentError, AgentTerminalReason, JobState, ToolExecutor};
-use crate::core::Message;
 use crate::router::ChatCapability;
 
 #[derive(Clone)]

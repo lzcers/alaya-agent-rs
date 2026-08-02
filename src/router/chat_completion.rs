@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 
 use crate::{
+    Message, MessageRole, Usage,
     agent::{ToolCall, ToolDef},
-    core::{Message, MessageRole, Usage},
     providers::{Request, Response},
     router::{ModelCapability, ModelRouter, RouterError},
 };
@@ -137,7 +137,7 @@ impl ChatCapability for ModelRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Message;
+    use crate::Message;
     use crate::providers::{
         deepseek_provider, deepseek_provider_from_env, openrouter_provider,
         openrouter_provider_from_env,

@@ -1,5 +1,5 @@
 use crate::{
-    core::Message,
+    Message,
     providers::Request,
     router::{ModelCapability, ModelRouter, RouterError},
 };

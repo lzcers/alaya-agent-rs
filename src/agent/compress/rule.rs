@@ -7,8 +7,8 @@ use super::conversation::{
     primary_conversation_layer_index, split_leading_system_messages,
 };
 use super::{CompressionError, ConversationRule, LayerAction, RuleCompression};
+use crate::Message;
 use crate::agent::{Context, Layer, MemoryError, MemoryStore};
-use crate::core::Message;
 
 const TOOL_RESULT_CLEARED: &str = "[Tool result cleared]";
 const REASONING_CLEARED: &str = "[Reasoning cleared]";

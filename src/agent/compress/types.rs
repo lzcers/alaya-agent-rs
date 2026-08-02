@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::Message;
 use crate::agent::memory::MemoryError;
 use crate::agent::{Layer, LayerKind};
-use crate::core::Message;
 use crate::router::{ChatCapability, RouterError};
 
 #[async_trait]

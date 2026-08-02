@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 // Re-export Context types from context module
 pub use crate::agent::context::{Context, Layer, LayerKind, LayerMeta};
-use crate::core::{Message, Usage};
+use crate::{Message, Usage};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenStatistics {

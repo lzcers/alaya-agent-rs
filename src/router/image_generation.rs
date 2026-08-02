@@ -1,5 +1,5 @@
 use crate::{
-    core::Message,
+    Message,
     providers::{GeneratedImage, ImageGenerationRequest},
     router::{ModelCapability, ModelRouter, RouterError},
 };
@@ -65,7 +65,7 @@ fn generated_image_to_url(image: GeneratedImage) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Message;
+    use crate::Message;
     use crate::providers::{
         ImageGenerationResponse, Provider, ProviderError, Request, Response, StreamResponse,
         openrouter_provider, openrouter_provider_from_env,

@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::core::Message;
+use crate::Message;
 
 /// 通用上下文 - 分层、类型化、可演化的数据容器
 ///

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::AgentActorEvent;
+use crate::Usage;
 use crate::agent::call_model::{
     CallModelEvent, CallToolError, CallToolResult, call_model, call_tools,
 };
@@ -17,7 +18,6 @@ use crate::agent::hooks::metrics::MetricsHook;
 use crate::agent::hooks::send_model_evt::SendModelEvtHook;
 use crate::agent::hooks::update_frame::UpdateFrameHook;
 use crate::agent::{AgentState, ToolCall, ToolExecutor};
-use crate::core::Usage;
 use crate::router::ChatCapability;
 
 //   - BeforeStep: 扩展 step 级控制。适合做最大迭代检查、预算/配额校验、任务取消判断、加载记忆、恢复 checkpoint、初始化 tracing/span。

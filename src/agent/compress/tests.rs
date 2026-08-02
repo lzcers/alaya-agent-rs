@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
+use crate::Message;
 use crate::agent::compress::{
     ChatSummaryModel, ConversationRule, LayerAction, LayerRule, LayerSelector, ModelCompression,
     RuleCompression, SummaryModel,
@@ -9,7 +10,6 @@ use crate::agent::compress::{
 use crate::agent::{
     Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall, ToolCallFunction,
 };
-use crate::core::Message;
 use crate::router::{ChatCapability, ChatChunk, RouterError};
 use futures::stream::{self, BoxStream};
 
