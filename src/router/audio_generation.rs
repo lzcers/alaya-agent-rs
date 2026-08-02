@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenAudioResponse {
     pub audio_data: String,
     pub transcript: String,

@@ -5,7 +5,7 @@ use crate::{
 };
 use async_trait::async_trait;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenImgResponse {
     pub image_urls: Vec<String>,
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::ToolCall;
 
 /// 用量
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
