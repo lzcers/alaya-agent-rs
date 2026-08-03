@@ -6,7 +6,10 @@ use thiserror::Error;
 use crate::Message;
 use crate::agent::memory::MemoryError;
 use crate::agent::{Layer, LayerKind};
-use crate::router::{ChatCapability, RouterError};
+use crate::{
+    providers::Request,
+    router::{ChatCapability, RouterError},
+};
 
 #[async_trait]
 pub trait SummaryModel: Send + Sync {
@@ -154,13 +157,15 @@ impl Default for ModelCompression {
 
 pub struct ChatSummaryModel<'a, C> {
     chat: &'a C,
+    request: Request,
     system_prompt: String,
 }
 
 impl<'a, C> ChatSummaryModel<'a, C> {
-    pub fn new(chat: &'a C) -> Self {
+    pub fn new(chat: &'a C, request: Request) -> Self {
         Self {
             chat,
+            request,
             system_prompt: DEFAULT_SUMMARY_SYSTEM_PROMPT.to_string(),
         }
     }
@@ -179,13 +184,10 @@ where
     async fn summarize(&self, prompt: &str) -> Result<String, RouterError> {
         let response = self
             .chat
-            .chat(
-                vec![
-                    Message::system(self.system_prompt.clone()),
-                    Message::user(prompt),
-                ],
-                None,
-            )
+            .chat(self.request.clone().with_messages(vec![
+                Message::system(self.system_prompt.clone()),
+                Message::user(prompt),
+            ]))
             .await?;
 
         match response {

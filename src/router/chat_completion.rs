@@ -3,7 +3,7 @@ use futures::stream::{BoxStream, StreamExt};
 
 use crate::{
     Message, MessageRole, Usage,
-    agent::{ToolCall, ToolDef},
+    agent::ToolCall,
     providers::{Request, Response},
     router::{ModelCapability, ModelRouter, RouterError},
 };
@@ -21,37 +21,18 @@ pub struct ChatChunk {
 
 #[async_trait]
 pub trait ChatCapability {
-    async fn chat(
-        &self,
-        msgs: Vec<Message>,
-        tools: Option<Vec<ToolDef>>,
-    ) -> Result<Message, RouterError>;
+    async fn chat(&self, request: Request) -> Result<Message, RouterError>;
 
     async fn chat_stream(
         &self,
-        msgs: Vec<Message>,
-        tools: Option<Vec<ToolDef>>,
+        request: Request,
     ) -> Result<BoxStream<'static, ChatChunk>, RouterError>;
 }
 
 #[async_trait]
 impl ChatCapability for ModelRouter {
-    async fn chat(
-        &self,
-        msg: Vec<Message>,
-        tools: Option<Vec<ToolDef>>,
-    ) -> Result<Message, RouterError> {
-        let (model_name, provider) = self.route(ModelCapability::Chat)?;
-        let mut request = Request::new(model_name, msg).with_tools(tools);
-
-        if let Some(reasoning_effort) = self.reasoning_effort() {
-            request = request.with_reasoning_effort(reasoning_effort);
-        }
-
-        if let Some(enabled) = self.thinking_enabled() {
-            request = request.with_thinking(enabled);
-        }
-
+    async fn chat(&self, request: Request) -> Result<Message, RouterError> {
+        let provider = self.route(&request.model, ModelCapability::Chat)?;
         let response: Response = provider.chat(request).await?;
 
         let choice = response
@@ -81,27 +62,9 @@ impl ChatCapability for ModelRouter {
 
     async fn chat_stream(
         &self,
-        msgs: Vec<Message>,
-        tools: Option<Vec<ToolDef>>,
+        request: Request,
     ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
-        let (model_name, provider) = self.route(ModelCapability::Chat)?;
-        let mut request = Request::new(model_name, msgs)
-            .with_stream(true)
-            .with_stream_usage(true)
-            .with_tools(tools);
-
-        if self.output_json() {
-            request = request.with_response_format_json();
-        }
-
-        if let Some(reasoning_effort) = self.reasoning_effort() {
-            request = request.with_reasoning_effort(reasoning_effort);
-        }
-
-        if let Some(enabled) = self.thinking_enabled() {
-            request = request.with_thinking(enabled);
-        }
-
+        let provider = self.route(&request.model, ModelCapability::Chat)?;
         let stream = provider.chat_stream(request).await?;
 
         Ok(stream
@@ -142,6 +105,7 @@ mod tests {
         deepseek_provider, deepseek_provider_from_env, openrouter_provider,
         openrouter_provider_from_env,
     };
+    use serde_json::json;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -163,14 +127,9 @@ mod tests {
             &[ModelCapability::Chat],
         );
 
-        if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-chat") {
-            eprintln!("Failed to set active model: {}", e);
-            return;
-        }
-
         let msg = Message::user("Say 'Hello, world!' in one sentence.");
 
-        let result = model.chat(vec![msg], None).await;
+        let result = model.chat(Request::new("deepseek-chat", vec![msg])).await;
         assert!(result.is_ok());
 
         let message = result.unwrap();
@@ -201,14 +160,11 @@ mod tests {
             &[ModelCapability::Chat],
         );
 
-        if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-chat") {
-            eprintln!("Failed to set active model: {}", e);
-            return;
-        }
-
         let msg = Message::user("Count from 1 to 3, each number on a new line.");
 
-        let result = model.chat_stream(vec![msg], None).await;
+        let result = model
+            .chat_stream(Request::new("deepseek-chat", vec![msg]).with_stream(true))
+            .await;
         assert!(result.is_ok());
 
         let mut stream = result.unwrap();
@@ -244,14 +200,11 @@ mod tests {
             &[ModelCapability::Chat],
         );
 
-        if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-reasoner") {
-            eprintln!("Failed to set active model: {}", e);
-            return;
-        }
-
         let msg = Message::user("What is 15 + 27? Please think step by step.");
 
-        let result = model.chat(vec![msg], None).await;
+        let result = model
+            .chat(Request::new("deepseek-reasoner", vec![msg]))
+            .await;
         assert!(result.is_ok());
 
         let message = result.unwrap();
@@ -292,14 +245,11 @@ mod tests {
             &[ModelCapability::Chat],
         );
 
-        if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-reasoner") {
-            eprintln!("Failed to set active model: {}", e);
-            return;
-        }
-
         let msg = Message::user("What is 8 * 7? Think step by step.");
 
-        let result = model.chat_stream(vec![msg], None).await;
+        let result = model
+            .chat_stream(Request::new("deepseek-reasoner", vec![msg]).with_stream(true))
+            .await;
         assert!(result.is_ok());
 
         let mut stream = result.unwrap();
@@ -345,15 +295,11 @@ mod tests {
             &[ModelCapability::Chat],
         );
 
-        if let Err(e) = model.set_active_model(ModelCapability::Chat, "google/gemini-3-pro-preview")
-        {
-            eprintln!("Failed to set active model: {}", e);
-            return;
-        }
-
         let msg = Message::user("Say 'Hello, world!' in one sentence.");
 
-        let result = model.chat(vec![msg], None).await;
+        let result = model
+            .chat(Request::new("google/gemini-3-pro-preview", vec![msg]))
+            .await;
         assert!(result.is_ok());
 
         let message = result.unwrap();
@@ -384,15 +330,11 @@ mod tests {
             &[ModelCapability::Chat],
         );
 
-        if let Err(e) = model.set_active_model(ModelCapability::Chat, "google/gemini-3-pro-preview")
-        {
-            eprintln!("Failed to set active model: {}", e);
-            return;
-        }
-
         let msg = Message::user("Count from 1 to 3, each number on a new line.");
 
-        let result = model.chat_stream(vec![msg], None).await;
+        let result = model
+            .chat_stream(Request::new("google/gemini-3-pro-preview", vec![msg]).with_stream(true))
+            .await;
         assert!(result.is_ok());
 
         let mut stream = result.unwrap();
@@ -433,31 +375,30 @@ mod tests {
     }
 
     #[test]
-    fn test_set_active_model() {
+    fn request_selects_the_model() {
         let provider = Arc::new(deepseek_provider("dummy_key"));
         let mut model = ModelRouter::new();
         model.add_model_provider("deepseek-chat", provider, &[ModelCapability::Chat]);
 
-        let result = model.set_active_model(ModelCapability::Chat, "deepseek-chat");
-        assert!(result.is_ok());
-        assert_eq!(
-            model.active_model(ModelCapability::Chat),
-            Some("deepseek-chat")
-        );
-
-        let result = model.set_active_model(ModelCapability::Chat, "non-existent-model");
-        assert!(result.is_err());
-        assert!(matches!(result, Err(RouterError::ModelNotFound(_))));
+        assert!(model.route("deepseek-chat", ModelCapability::Chat).is_ok());
+        assert!(matches!(
+            model.route("non-existent-model", ModelCapability::Chat),
+            Err(RouterError::ModelNotFound(_))
+        ));
     }
 
     #[test]
-    fn test_set_reasoning_options() {
-        let mut model = ModelRouter::new();
+    fn reasoning_options_belong_to_the_request() {
+        let request = Request::new("model", Vec::new())
+            .with_response_format_json()
+            .with_reasoning_effort("high")
+            .with_thinking(true);
 
-        model.set_reasoning_effort("high");
-        model.set_thinking_enabled(true);
-
-        assert_eq!(model.reasoning_effort(), Some("high"));
-        assert_eq!(model.thinking_enabled(), Some(true));
+        assert!(request.extra.contains_key("response_format"));
+        assert_eq!(request.extra.get("reasoning_effort"), Some(&json!("high")));
+        assert_eq!(
+            request.extra.get("thinking"),
+            Some(&json!({ "type": "enabled" }))
+        );
     }
 }

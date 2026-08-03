@@ -39,22 +39,11 @@ impl fmt::Display for ModelCapability {
 /// Routes model operations to their provider.
 ///
 /// Registration is keyed by capability and model name, so the same model name
-/// may use different providers for different operations. Each capability also
-/// keeps an independent active model and its own request options.
+/// may use different providers for different operations. Model selection and
+/// invocation options are supplied by each request; the router keeps no call state.
 #[derive(Clone)]
 pub struct ModelRouter {
     routes: HashMap<ModelCapability, HashMap<String, Arc<dyn Provider>>>,
-    active_models: HashMap<ModelCapability, String>,
-
-    output_json: bool,
-    reasoning_effort: Option<String>,
-    thinking_enabled: Option<bool>,
-
-    aspect_ratio: String,
-    image_size: String,
-
-    audio_format: String,
-    voice: Option<String>,
 }
 
 impl Default for ModelRouter {
@@ -67,14 +56,6 @@ impl ModelRouter {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
-            active_models: HashMap::new(),
-            output_json: false,
-            reasoning_effort: None,
-            thinking_enabled: None,
-            aspect_ratio: "1:1".to_string(),
-            image_size: "1K".to_string(),
-            audio_format: "wav".to_string(),
-            voice: None,
         }
     }
 
@@ -108,119 +89,36 @@ impl ModelRouter {
         }
     }
 
-    pub fn set_active_model(
-        &mut self,
-        capability: ModelCapability,
-        model_name: &str,
-    ) -> Result<(), RouterError> {
-        if !self.contains_model(model_name) {
-            return Err(RouterError::ModelNotFound(model_name.to_owned()));
-        }
-        if !self.supports(model_name, capability) {
-            return Err(RouterError::UnsupportedCapability {
-                model: model_name.to_owned(),
-                capability: capability.as_str(),
-            });
-        }
-
-        self.active_models.insert(capability, model_name.to_owned());
-        Ok(())
-    }
-
-    pub fn active_model(&self, capability: ModelCapability) -> Option<&str> {
-        self.active_models.get(&capability).map(String::as_str)
-    }
-
     pub fn supports(&self, model_name: &str, capability: ModelCapability) -> bool {
         self.routes
             .get(&capability)
             .is_some_and(|routes| routes.contains_key(model_name))
     }
 
-    pub fn set_output_json(&mut self, output_json: bool) {
-        self.output_json = output_json;
-    }
-
-    pub fn set_reasoning_effort(&mut self, reasoning_effort: impl Into<String>) {
-        self.reasoning_effort = Some(reasoning_effort.into());
-    }
-
-    pub fn set_thinking_enabled(&mut self, enabled: bool) {
-        self.thinking_enabled = Some(enabled);
-    }
-
-    pub fn with_aspect_ratio(mut self, aspect_ratio: impl Into<String>) -> Self {
-        self.aspect_ratio = aspect_ratio.into();
-        self
-    }
-
-    pub fn with_image_size(mut self, image_size: impl Into<String>) -> Self {
-        self.image_size = image_size.into();
-        self
-    }
-
-    pub fn with_audio_format(mut self, audio_format: impl Into<String>) -> Self {
-        self.audio_format = audio_format.into();
-        self
-    }
-
-    pub fn with_voice(mut self, voice: impl Into<String>) -> Self {
-        self.voice = Some(voice.into());
-        self
-    }
-
     pub(super) fn route(
         &self,
+        model_name: &str,
         capability: ModelCapability,
-    ) -> Result<(&str, &Arc<dyn Provider>), RouterError> {
-        let model_name = self
-            .active_models
-            .get(&capability)
-            .ok_or(RouterError::NoActiveModel(capability.as_str()))?;
+    ) -> Result<&Arc<dyn Provider>, RouterError> {
+        if !self.contains_model(model_name) {
+            return Err(RouterError::ModelNotFound(model_name.to_owned()));
+        }
         let provider = self
             .routes
             .get(&capability)
             .and_then(|routes| routes.get(model_name))
             .ok_or_else(|| RouterError::UnsupportedCapability {
-                model: model_name.clone(),
+                model: model_name.to_string(),
                 capability: capability.as_str(),
             })?;
 
-        Ok((model_name, provider))
+        Ok(provider)
     }
 
     fn contains_model(&self, model_name: &str) -> bool {
         self.routes
             .values()
             .any(|routes| routes.contains_key(model_name))
-    }
-
-    pub(super) fn output_json(&self) -> bool {
-        self.output_json
-    }
-
-    pub(super) fn reasoning_effort(&self) -> Option<&str> {
-        self.reasoning_effort.as_deref()
-    }
-
-    pub(super) fn thinking_enabled(&self) -> Option<bool> {
-        self.thinking_enabled
-    }
-
-    pub(super) fn aspect_ratio(&self) -> &str {
-        &self.aspect_ratio
-    }
-
-    pub(super) fn image_size(&self) -> &str {
-        &self.image_size
-    }
-
-    pub(super) fn audio_format(&self) -> &str {
-        &self.audio_format
-    }
-
-    pub(super) fn voice(&self) -> Option<&str> {
-        self.voice.as_deref()
     }
 }
 
@@ -230,7 +128,7 @@ mod tests {
     use crate::providers::{deepseek_provider, openrouter_provider};
 
     #[test]
-    fn registration_is_shared_and_active_models_are_per_capability() {
+    fn registration_is_keyed_by_model_and_capability() {
         let provider = Arc::new(openrouter_provider("dummy_key"));
         let mut router = ModelRouter::new();
         router.add_model_provider(
@@ -239,22 +137,12 @@ mod tests {
             &[ModelCapability::Chat, ModelCapability::Image],
         );
 
-        router
-            .set_active_model(ModelCapability::Chat, "omni-model")
-            .unwrap();
-        router
-            .set_active_model(ModelCapability::Image, "omni-model")
-            .unwrap();
-
-        assert_eq!(
-            router.active_model(ModelCapability::Chat),
-            Some("omni-model")
-        );
-        assert_eq!(
-            router.active_model(ModelCapability::Image),
-            Some("omni-model")
-        );
-        assert_eq!(router.active_model(ModelCapability::Audio), None);
+        assert!(router.route("omni-model", ModelCapability::Chat).is_ok());
+        assert!(router.route("omni-model", ModelCapability::Image).is_ok());
+        assert!(matches!(
+            router.route("omni-model", ModelCapability::Audio),
+            Err(RouterError::UnsupportedCapability { .. })
+        ));
     }
 
     #[test]
@@ -291,9 +179,10 @@ mod tests {
         let mut router = ModelRouter::new();
         router.add_model_provider("deepseek-chat", provider, &[ModelCapability::Chat]);
 
-        let error = router
-            .set_active_model(ModelCapability::Image, "deepseek-chat")
-            .unwrap_err();
+        let error = match router.route("deepseek-chat", ModelCapability::Image) {
+            Ok(_) => panic!("image route should be rejected"),
+            Err(error) => error,
+        };
 
         assert!(matches!(
             error,

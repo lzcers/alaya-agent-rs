@@ -50,7 +50,12 @@ where
 
         // 执行生命周期函数
         let lifecycle_flow = lifecycle
-            .start(chat.as_ref(), tool_executor.as_ref(), event_tx.as_ref())
+            .start(
+                chat.as_ref(),
+                &self.chat_request,
+                tool_executor.as_ref(),
+                event_tx.as_ref(),
+            )
             .await;
 
         match lifecycle_flow {

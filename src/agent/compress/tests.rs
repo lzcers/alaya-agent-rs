@@ -10,7 +10,10 @@ use crate::agent::compress::{
 use crate::agent::{
     Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall, ToolCallFunction,
 };
-use crate::router::{ChatCapability, ChatChunk, RouterError};
+use crate::{
+    providers::Request,
+    router::{ChatCapability, ChatChunk, RouterError},
+};
 use futures::stream::{self, BoxStream};
 
 fn conversation_with_tools_and_reasoning() -> Vec<Message> {
@@ -113,21 +116,16 @@ struct StubChatModel {
 
 #[async_trait]
 impl ChatCapability for StubChatModel {
-    async fn chat(
-        &self,
-        msgs: Vec<Message>,
-        _tools: Option<Vec<crate::agent::ToolDef>>,
-    ) -> Result<Message, RouterError> {
-        assert_eq!(msgs.len(), 2);
-        assert!(matches!(msgs[0], Message::System { .. }));
-        assert!(matches!(msgs[1], Message::User { .. }));
+    async fn chat(&self, request: Request) -> Result<Message, RouterError> {
+        assert_eq!(request.messages.len(), 2);
+        assert!(matches!(request.messages[0], Message::System { .. }));
+        assert!(matches!(request.messages[1], Message::User { .. }));
         Ok(self.response.clone())
     }
 
     async fn chat_stream(
         &self,
-        _msgs: Vec<Message>,
-        _tools: Option<Vec<crate::agent::ToolDef>>,
+        _request: Request,
     ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
         Ok(Box::pin(stream::empty()))
     }
@@ -341,7 +339,7 @@ async fn chat_summary_model_adapts_chat_capability() {
     let model = StubChatModel {
         response: Message::assistant("summary from chat model"),
     };
-    let adapter = ChatSummaryModel::new(&model);
+    let adapter = ChatSummaryModel::new(&model, Request::new("summary-model", Vec::new()));
 
     let summary = adapter
         .summarize("Summarize this conversation.")

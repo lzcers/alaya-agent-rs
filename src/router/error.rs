@@ -13,8 +13,6 @@ pub enum RouterError {
     StreamError(String),
     #[error("Model not found: {0}")]
     ModelNotFound(String),
-    #[error("No active {0} model")]
-    NoActiveModel(&'static str),
     #[error("Model {model} does not support {capability}")]
     UnsupportedCapability {
         model: String,

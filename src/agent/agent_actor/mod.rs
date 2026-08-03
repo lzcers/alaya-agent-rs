@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::{AgentState, Context, Metrics, ToolExecutor};
-use crate::router::ChatCapability;
+use crate::{providers::Request, router::ChatCapability};
 
 pub use builder::AgentActorBuilder;
 pub use loop_control::LoopState;
@@ -32,6 +32,8 @@ where
     state: AgentState,
     /// Chat 模型
     chat: Arc<C>,
+    /// 每次 step 使用的 Chat 请求配置；messages 和 tools 会在调用前刷新。
+    chat_request: Request,
     /// 工具执行器
     tool_executor: Arc<E>,
     /// 等待中的用户输入
@@ -44,12 +46,17 @@ where
     E: ToolExecutor + Send,
 {
     /// 创建新的 Agent Actor
-    pub fn new(chat: C, tool_executor: E, context: Context) -> Self {
-        Self::with_runtime_hooks(chat, tool_executor, context)
+    pub fn new(chat: C, chat_request: Request, tool_executor: E, context: Context) -> Self {
+        Self::with_runtime_hooks(chat, chat_request, tool_executor, context)
     }
 
     /// 创建带内部 runtime hooks 和扩展 hooks 的 Agent Actor
-    pub(crate) fn with_runtime_hooks(chat: C, tool_executor: E, context: Context) -> Self {
+    pub(crate) fn with_runtime_hooks(
+        chat: C,
+        chat_request: Request,
+        tool_executor: E,
+        context: Context,
+    ) -> Self {
         let default_max_iterations = 10;
         Self {
             state: AgentState {
@@ -64,6 +71,7 @@ where
                 metrics: Metrics::with_max_iterations(default_max_iterations),
             },
             chat: Arc::new(chat),
+            chat_request,
             tool_executor: Arc::new(tool_executor),
             pending_user_input: None,
         }

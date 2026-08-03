@@ -105,6 +105,14 @@ impl Conversation {
         Ok(())
     }
 
+    /// Restores conversation history while retaining usage already incurred by the current run.
+    pub fn restore_history(&mut self, snapshot: ConversationSnapshot) -> Result<(), String> {
+        validate_snapshot(&snapshot)?;
+        self.epoch = snapshot.epoch;
+        self.messages = snapshot.messages;
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         debug_assert!(matches!(
             self.messages.first(),
@@ -196,5 +204,27 @@ mod tests {
                 usage: CacheUsageTotals::default(),
             }
         );
+    }
+
+    #[test]
+    fn restore_history_preserves_usage() {
+        let mut conversation =
+            Conversation::new("system".to_string(), ConversationConfig::default());
+        let snapshot = conversation.snapshot();
+        conversation.push(Message::user("uncommitted"));
+        conversation.record_usage(Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            prompt_cache_hit_tokens: Some(4),
+            prompt_cache_miss_tokens: Some(6),
+        }));
+
+        conversation.restore_history(snapshot).unwrap();
+
+        let restored = conversation.snapshot();
+        assert_eq!(restored.messages, vec![Message::system("system")]);
+        assert_eq!(restored.usage.requests, 1);
+        assert_eq!(restored.usage.prompt_tokens, 10);
     }
 }

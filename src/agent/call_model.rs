@@ -1,6 +1,7 @@
-use crate::agent::{ToolCall, ToolDef, ToolExecutor};
+use crate::Usage;
+use crate::agent::{ToolCall, ToolExecutor};
+use crate::providers::Request;
 use crate::router::{ChatCapability, format_router_error};
-use crate::{Message, Usage};
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -48,8 +49,7 @@ pub enum CallModelEvent {
 // 调用一个具备 chat 能力的模型，至少要实现 chat_stream 方法
 pub fn call_model(
     model: &(dyn ChatCapability + Sync),
-    messages: &[Message],
-    tools_def: Option<&[ToolDef]>,
+    request: Request,
 ) -> impl Stream<Item = CallModelEvent> {
     let mut final_content = String::new();
     let mut final_reasoning_content = String::new();
@@ -58,10 +58,7 @@ pub fn call_model(
     stream! {
         let mut completed = false;
         // 流式调用模型
-        let mut response_stream = match model
-            .chat_stream(messages.to_vec(), tools_def.map(|tools| tools.to_vec()))
-            .await
-        {
+        let mut response_stream = match model.chat_stream(request).await {
             Ok(s) => s,
             Err(e) => {
                 yield CallModelEvent::Error(format_router_error(&e));
@@ -212,7 +209,10 @@ fn merge_tool_calls(accumulated: &mut Vec<ToolCall>, incremental: Vec<ToolCall>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::router::{ChatChunk, RouterError};
+    use crate::{
+        Message,
+        router::{ChatChunk, RouterError},
+    };
     use async_trait::async_trait;
     use futures::{StreamExt, stream, stream::BoxStream};
 
@@ -222,18 +222,13 @@ mod tests {
 
     #[async_trait]
     impl ChatCapability for MockChatModel {
-        async fn chat(
-            &self,
-            _msgs: Vec<Message>,
-            _tools: Option<Vec<ToolDef>>,
-        ) -> Result<Message, RouterError> {
+        async fn chat(&self, _request: Request) -> Result<Message, RouterError> {
             panic!("chat should not be called in this test");
         }
 
         async fn chat_stream(
             &self,
-            _msgs: Vec<Message>,
-            _tools: Option<Vec<ToolDef>>,
+            _request: Request,
         ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
             Ok(Box::pin(stream::iter(self.chunks.clone())))
         }
@@ -270,9 +265,12 @@ mod tests {
             ],
         };
 
-        let events = call_model(&model, &[Message::user("hi")], None)
-            .collect::<Vec<_>>()
-            .await;
+        let events = call_model(
+            &model,
+            Request::new("mock-model", vec![Message::user("hi")]).with_stream(true),
+        )
+        .collect::<Vec<_>>()
+        .await;
 
         assert!(matches!(
             events.as_slice(),

@@ -1,5 +1,4 @@
 use crate::{
-    Message,
     providers::{GeneratedImage, ImageGenerationRequest},
     router::{ModelCapability, ModelRouter, RouterError},
 };
@@ -12,28 +11,20 @@ pub struct GenImgResponse {
 
 #[async_trait]
 pub trait GenImgCapability {
-    async fn gen_img(&self, msgs: Vec<Message>) -> Result<GenImgResponse, RouterError>;
+    async fn gen_img(&self, request: ImageGenerationRequest)
+    -> Result<GenImgResponse, RouterError>;
 }
 
 #[async_trait]
 impl GenImgCapability for ModelRouter {
-    async fn gen_img(&self, msgs: Vec<Message>) -> Result<GenImgResponse, RouterError> {
-        let (model_name, provider) = self.route(ModelCapability::Image)?;
-
-        let prompt = msgs
-            .iter()
-            .map(Message::content)
-            .map(str::trim)
-            .filter(|content| !content.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if prompt.is_empty() {
+    async fn gen_img(
+        &self,
+        request: ImageGenerationRequest,
+    ) -> Result<GenImgResponse, RouterError> {
+        let provider = self.route(&request.model, ModelCapability::Image)?;
+        if request.prompt.trim().is_empty() {
             return Err(RouterError::NoResponse);
         }
-
-        let request = ImageGenerationRequest::new(model_name, prompt)
-            .with_resolution(self.image_size())
-            .with_aspect_ratio(self.aspect_ratio());
         let response = provider.generate_image(request).await?;
         let image_urls = response
             .data
@@ -116,23 +107,21 @@ mod tests {
     #[tokio::test]
     async fn gen_img_builds_dedicated_image_request_and_returns_data_url() {
         let provider = Arc::new(MockImageProvider::default());
-        let mut model = ModelRouter::new()
-            .with_aspect_ratio("16:9".to_string())
-            .with_image_size("1K".to_string());
+        let mut model = ModelRouter::new();
         model.add_model_provider(
             "krea/krea-2-medium-turbo",
             provider.clone(),
             &[ModelCapability::Image],
         );
-        model
-            .set_active_model(ModelCapability::Image, "krea/krea-2-medium-turbo")
-            .unwrap();
-
         let response = model
-            .gen_img(vec![
-                Message::system("visual direction"),
-                Message::user("cinematic landscape"),
-            ])
+            .gen_img(
+                ImageGenerationRequest::new(
+                    "krea/krea-2-medium-turbo",
+                    "visual direction\n\ncinematic landscape",
+                )
+                .with_aspect_ratio("16:9")
+                .with_resolution("1K"),
+            )
             .await
             .unwrap();
 
@@ -160,9 +149,7 @@ mod tests {
             }
         };
 
-        let mut model = ModelRouter::new()
-            .with_aspect_ratio("1:1".to_string())
-            .with_image_size("1K".to_string());
+        let mut model = ModelRouter::new();
 
         model.add_model_provider(
             "black-forest-labs/flux.2-klein-4b",
@@ -170,16 +157,15 @@ mod tests {
             &[ModelCapability::Image],
         );
 
-        if let Err(e) =
-            model.set_active_model(ModelCapability::Image, "black-forest-labs/flux.2-klein-4b")
-        {
-            eprintln!("Failed to set active model: {}", e);
-            return;
-        }
-
         let msg = Message::user("Generate a beautiful sunset over mountains");
 
-        let result = model.gen_img(vec![msg]).await;
+        let result = model
+            .gen_img(
+                ImageGenerationRequest::new("black-forest-labs/flux.2-klein-4b", msg.content())
+                    .with_aspect_ratio("1:1")
+                    .with_resolution("1K"),
+            )
+            .await;
         if let Err(e) = result {
             eprintln!("Failed to generate image: {}", e);
             return;
@@ -211,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_active_model() {
+    fn request_selects_the_model() {
         let provider = Arc::new(openrouter_provider("dummy_key"));
         let mut model = ModelRouter::new();
         model.add_model_provider(
@@ -220,26 +206,24 @@ mod tests {
             &[ModelCapability::Image],
         );
 
-        let result =
-            model.set_active_model(ModelCapability::Image, "black-forest-labs/flux.2-klein-4b");
-        assert!(result.is_ok());
-        assert_eq!(
-            model.active_model(ModelCapability::Image),
-            Some("black-forest-labs/flux.2-klein-4b")
+        assert!(
+            model
+                .route("black-forest-labs/flux.2-klein-4b", ModelCapability::Image)
+                .is_ok()
         );
-
-        let result = model.set_active_model(ModelCapability::Image, "non-existent-model");
-        assert!(result.is_err());
-        assert!(matches!(result, Err(RouterError::ModelNotFound(_))));
+        assert!(matches!(
+            model.route("non-existent-model", ModelCapability::Image),
+            Err(RouterError::ModelNotFound(_))
+        ));
     }
 
     #[test]
-    fn test_builder_methods() {
-        let model = ModelRouter::new()
-            .with_aspect_ratio("16:9".to_string())
-            .with_image_size("2K".to_string());
+    fn image_options_belong_to_the_request() {
+        let request = ImageGenerationRequest::new("model", "prompt")
+            .with_aspect_ratio("16:9")
+            .with_resolution("2K");
 
-        assert_eq!(model.aspect_ratio(), "16:9");
-        assert_eq!(model.image_size(), "2K");
+        assert_eq!(request.aspect_ratio.as_deref(), Some("16:9"));
+        assert_eq!(request.resolution.as_deref(), Some("2K"));
     }
 }

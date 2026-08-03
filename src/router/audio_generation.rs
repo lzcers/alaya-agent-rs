@@ -1,11 +1,10 @@
 use crate::{
-    Message,
     providers::Request,
     router::{ModelCapability, ModelRouter, RouterError},
 };
 use async_trait::async_trait;
 use futures::StreamExt;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenAudioResponse {
@@ -16,34 +15,14 @@ pub struct GenAudioResponse {
 
 #[async_trait]
 pub trait GenAudioCapability {
-    async fn gen_audio(&self, msgs: Vec<Message>) -> Result<GenAudioResponse, RouterError>;
-}
-
-impl ModelRouter {
-    fn audio_config(&self) -> Value {
-        let mut audio = Map::new();
-        audio.insert("format".to_string(), json!(self.audio_format()));
-
-        if let Some(voice) = self.voice() {
-            audio.insert("voice".to_string(), json!(voice));
-        }
-
-        Value::Object(audio)
-    }
+    async fn gen_audio(&self, request: Request) -> Result<GenAudioResponse, RouterError>;
 }
 
 #[async_trait]
 impl GenAudioCapability for ModelRouter {
-    async fn gen_audio(&self, msgs: Vec<Message>) -> Result<GenAudioResponse, RouterError> {
-        let (model_name, provider) = self.route(ModelCapability::Audio)?;
-
-        let mut extra = std::collections::HashMap::new();
-        extra.insert("modalities".to_string(), json!(["text", "audio"]));
-        extra.insert("audio".to_string(), self.audio_config());
-
-        let mut request = Request::new(model_name, msgs).with_stream(true);
-        request.extra = extra;
-
+    async fn gen_audio(&self, request: Request) -> Result<GenAudioResponse, RouterError> {
+        let provider = self.route(&request.model, ModelCapability::Audio)?;
+        let format = audio_format(&request);
         let mut stream = provider.chat_stream(request).await?;
         let mut audio_data = String::new();
         let mut transcript = String::new();
@@ -68,19 +47,32 @@ impl GenAudioCapability for ModelRouter {
         Ok(GenAudioResponse {
             audio_data,
             transcript,
-            format: self.audio_format().to_string(),
+            format,
         })
     }
+}
+
+fn audio_format(request: &Request) -> String {
+    request
+        .extra
+        .get("audio")
+        .and_then(Value::as_object)
+        .and_then(|audio| audio.get("format"))
+        .and_then(Value::as_str)
+        .unwrap_or("wav")
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Message;
     use crate::providers::{
         ChoiceAudio, Delta, Provider, ProviderError, StreamChoice, StreamResponse,
         openrouter_provider, openrouter_provider_from_env,
     };
     use futures::stream::{self, BoxStream};
+    use serde_json::json;
     use std::sync::Arc;
 
     struct MockAudioProvider;
@@ -156,12 +148,15 @@ mod tests {
             provider,
             &[ModelCapability::Audio],
         );
-        model
-            .set_active_model(ModelCapability::Audio, "google/lyria-3-clip-preview")
-            .unwrap();
-
         let response = model
-            .gen_audio(vec![Message::user("Generate a short piano loop")])
+            .gen_audio(
+                Request::new(
+                    "google/lyria-3-clip-preview",
+                    vec![Message::user("Generate a short piano loop")],
+                )
+                .with_stream(true)
+                .with_audio("wav", None),
+            )
             .await
             .unwrap();
 
@@ -183,25 +178,24 @@ mod tests {
             }
         };
 
-        let mut model = ModelRouter::new().with_audio_format("wav".to_string());
+        let mut model = ModelRouter::new();
         model.add_model_provider(
             "google/lyria-3-clip-preview",
             provider,
             &[ModelCapability::Audio],
         );
 
-        if let Err(e) =
-            model.set_active_model(ModelCapability::Audio, "google/lyria-3-clip-preview")
-        {
-            eprintln!("Failed to set active model: {}", e);
-            return;
-        }
-
         let prompt = std::env::var("LYRIA_TEST_PROMPT")
             .unwrap_or_else(|_| "Generate a short upbeat synth loop with no vocals".to_string());
         let msg = Message::user(prompt);
 
-        let result = model.gen_audio(vec![msg]).await;
+        let result = model
+            .gen_audio(
+                Request::new("google/lyria-3-clip-preview", vec![msg])
+                    .with_stream(true)
+                    .with_audio("wav", None),
+            )
+            .await;
         if let Err(e) = result {
             eprintln!("Failed to generate audio: {}", e);
             return;
@@ -236,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_active_model() {
+    fn request_selects_the_model() {
         let provider = Arc::new(openrouter_provider("dummy_key"));
         let mut model = ModelRouter::new();
         model.add_model_provider(
@@ -245,29 +239,27 @@ mod tests {
             &[ModelCapability::Audio],
         );
 
-        let result = model.set_active_model(ModelCapability::Audio, "google/lyria-3-clip-preview");
-        assert!(result.is_ok());
-        assert_eq!(
-            model.active_model(ModelCapability::Audio),
-            Some("google/lyria-3-clip-preview")
+        assert!(
+            model
+                .route("google/lyria-3-clip-preview", ModelCapability::Audio)
+                .is_ok()
         );
-
-        let result = model.set_active_model(ModelCapability::Audio, "non-existent-model");
-        assert!(result.is_err());
-        assert!(matches!(result, Err(RouterError::ModelNotFound(_))));
+        assert!(matches!(
+            model.route("non-existent-model", ModelCapability::Audio),
+            Err(RouterError::ModelNotFound(_))
+        ));
     }
 
     #[test]
-    fn test_builder_methods() {
-        let model = ModelRouter::new()
-            .with_audio_format("mp3".to_string())
-            .with_voice("alloy".to_string());
+    fn audio_options_belong_to_the_request() {
+        let request = Request::new("model", Vec::new())
+            .with_stream(true)
+            .with_audio("mp3", Some("alloy".to_string()));
 
-        assert_eq!(model.audio_format(), "mp3");
-        assert_eq!(model.voice(), Some("alloy"));
+        assert_eq!(audio_format(&request), "mp3");
         assert_eq!(
-            model.audio_config(),
-            json!({ "format": "mp3", "voice": "alloy" })
+            request.extra.get("audio"),
+            Some(&json!({ "format": "mp3", "voice": "alloy" }))
         );
     }
 }

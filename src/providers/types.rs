@@ -238,6 +238,11 @@ impl Request {
         self
     }
 
+    pub fn with_messages(mut self, messages: Vec<crate::Message>) -> Self {
+        self.messages = messages;
+        self
+    }
+
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
@@ -307,6 +312,18 @@ impl Request {
                 "type": if enabled { "enabled" } else { "disabled" },
             }),
         );
+        self
+    }
+
+    pub fn with_audio(mut self, format: impl Into<String>, voice: Option<String>) -> Self {
+        let mut audio = serde_json::Map::new();
+        audio.insert("format".to_string(), json!(format.into()));
+        if let Some(voice) = voice {
+            audio.insert("voice".to_string(), json!(voice));
+        }
+        self.extra
+            .insert("modalities".to_string(), json!(["text", "audio"]));
+        self.extra.insert("audio".to_string(), Value::Object(audio));
         self
     }
 }

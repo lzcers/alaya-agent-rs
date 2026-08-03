@@ -4,6 +4,7 @@ use crate::agent::{
     Tool, ToolCall, ToolCallFunction, ToolDef, ToolExecutorError,
 };
 
+use crate::providers::Request;
 use crate::providers::deepseek_provider_from_env;
 use crate::router::{ChatCapability, ChatChunk, ModelCapability, ModelRouter, RouterError};
 use crate::{Message, Usage};
@@ -90,18 +91,13 @@ struct MockChatModel {
 
 #[async_trait]
 impl ChatCapability for MockChatModel {
-    async fn chat(
-        &self,
-        _msgs: Vec<Message>,
-        _tools: Option<Vec<ToolDef>>,
-    ) -> Result<Message, RouterError> {
+    async fn chat(&self, _request: Request) -> Result<Message, RouterError> {
         panic!("chat should not be called in this test");
     }
 
     async fn chat_stream(
         &self,
-        _msgs: Vec<Message>,
-        _tools: Option<Vec<ToolDef>>,
+        _request: Request,
     ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
         Ok(Box::pin(stream::iter(self.chunks.clone())))
     }
@@ -164,11 +160,6 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
     // 2. 创建 ModelRouter
     let mut model = ModelRouter::new();
     model.add_model_provider("deepseek-reasoner", provider, &[ModelCapability::Chat]);
-    if let Err(e) = model.set_active_model(ModelCapability::Chat, "deepseek-reasoner") {
-        print_section("Setup Error");
-        print_field("reason", e.to_string());
-        return;
-    }
 
     // 3. 创建工具执行器并注册真实的 Playwright 工具
     let mut executor = GenericToolExecutor::new();
@@ -190,7 +181,12 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
     );
 
     // 5. 创建 AgentActo
-    let actor = AgentActor::new(model, executor, context);
+    let actor = AgentActor::new(
+        model,
+        Request::new("deepseek-reasoner", Vec::new()).with_stream(true),
+        executor,
+        context,
+    );
 
     // 6. 启动 Actor
     let mut handle = actor.run_loop();
@@ -379,7 +375,12 @@ async fn test_agent_actor_accumulates_usage_from_stream_response() {
     let mut context = Context::new();
     context.add_message(Message::user("hello"));
 
-    let mut actor = AgentActor::new(model, executor, context);
+    let mut actor = AgentActor::new(
+        model,
+        Request::new("mock-model", Vec::new()).with_stream(true),
+        executor,
+        context,
+    );
     let result = actor.run_step(None).await;
 
     assert!(matches!(result, crate::agent::StepResult::Done { .. }));
@@ -425,7 +426,12 @@ async fn test_agent_actor_emits_step_frame_metrics_to_upper_layer() {
     let mut context = Context::new();
     context.add_message(Message::user("hello"));
 
-    let mut actor = AgentActor::new(model, executor, context);
+    let mut actor = AgentActor::new(
+        model,
+        Request::new("mock-model", Vec::new()).with_stream(true),
+        executor,
+        context,
+    );
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let result = actor.run_step(Some(event_tx)).await;
 
@@ -469,7 +475,12 @@ async fn test_agent_actor_records_error_metrics_when_max_iterations_exceeded() {
     let mut context = Context::new();
     context.add_message(Message::user("hello"));
 
-    let mut actor = AgentActor::new(model, executor, context);
+    let mut actor = AgentActor::new(
+        model,
+        Request::new("mock-model", Vec::new()).with_stream(true),
+        executor,
+        context,
+    );
     actor.state_mut().metrics.execution.max_iterations = 0;
 
     let result = actor.run_step(None).await;

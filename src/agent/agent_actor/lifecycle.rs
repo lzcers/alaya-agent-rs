@@ -18,7 +18,7 @@ use crate::agent::hooks::metrics::MetricsHook;
 use crate::agent::hooks::send_model_evt::SendModelEvtHook;
 use crate::agent::hooks::update_frame::UpdateFrameHook;
 use crate::agent::{AgentState, ToolCall, ToolExecutor};
-use crate::router::ChatCapability;
+use crate::{providers::Request, router::ChatCapability};
 
 //   - BeforeStep: 扩展 step 级控制。适合做最大迭代检查、预算/配额校验、任务取消判断、加载记忆、恢复 checkpoint、初始化 tracing/span。
 //   - BeforeCallModel: 扩展模型调用前编排。适合做 Prompt 注入、上下文裁剪/压缩、模型路由、动态开关工具、调用前安全策略检查。
@@ -229,6 +229,7 @@ impl StepLifeCycle {
     pub(super) async fn start(
         &mut self,
         model: &(dyn ChatCapability + Sync),
+        request: &Request,
         tool_executor: &dyn ToolExecutor,
         event_tx: Option<&mpsc::Sender<AgentActorEvent>>,
     ) -> LifeCycleFlow {
@@ -240,7 +241,11 @@ impl StepLifeCycle {
         self.call_life_cycle_hook(LifeCycle::BeforeCallModel)
             .await?;
 
-        let mut stream = pin!(call_model(model, &messages, Some(&tools)));
+        let request = request
+            .clone()
+            .with_messages(messages)
+            .with_tools(Some(tools));
+        let mut stream = pin!(call_model(model, request));
         while let Some(evt) = stream.next().await {
             self.ctx.set_model_event(&evt);
             self.call_life_cycle_hook(LifeCycle::OnModelEvent).await?;

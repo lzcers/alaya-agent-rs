@@ -1,6 +1,6 @@
 use super::AgentActor;
 use crate::agent::{Context, ToolExecutor};
-use crate::router::ChatCapability;
+use crate::{providers::Request, router::ChatCapability};
 
 /// Agent Actor 构建器
 pub struct AgentActorBuilder<C, E>
@@ -9,6 +9,7 @@ where
     E: ToolExecutor + Send + 'static,
 {
     chat: C,
+    chat_request: Request,
     tool_executor: E,
     context: Context,
     max_iterations: usize,
@@ -21,9 +22,10 @@ where
     E: ToolExecutor + Send + 'static,
 {
     /// 创建新的构建器
-    pub fn new(chat: C, tool_executor: E) -> Self {
+    pub fn new(chat: C, chat_request: Request, tool_executor: E) -> Self {
         Self {
             chat,
+            chat_request,
             tool_executor,
             context: Context::new(),
             max_iterations: 10,
@@ -51,7 +53,12 @@ where
 
     /// 构建 AgentActor
     pub fn build(self) -> AgentActor<C, E> {
-        let mut actor = AgentActor::with_runtime_hooks(self.chat, self.tool_executor, self.context);
+        let mut actor = AgentActor::with_runtime_hooks(
+            self.chat,
+            self.chat_request,
+            self.tool_executor,
+            self.context,
+        );
         actor.state.metrics.execution.max_iterations = self.max_iterations;
         actor.state.user_id = self.user_id;
         actor

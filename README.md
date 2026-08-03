@@ -71,9 +71,9 @@ tokio = { version = "1", features = ["full"] }
 ```rust
 use alaya_agent::{
     context::{Context, Layer, LayerKind},
-    providers::deepseek_provider_from_env,
+    providers::{Request, deepseek_provider_from_env},
     router::{ChatCapability, ModelCapability, ModelRouter},
-    core::Message,
+    Message,
 };
 use std::sync::Arc;
 
@@ -87,7 +87,6 @@ async fn main() -> anyhow::Result<()> {
     // 2. 配置模型路由
     let mut router = ModelRouter::new();
     router.add_model_provider("deepseek-chat", provider, &[ModelCapability::Chat]);
-    router.set_active_model(ModelCapability::Chat, "deepseek-chat")?;
 
     // 3. 构建上下文
     let ctx = Context::new().layer(Layer::new(
@@ -103,7 +102,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 4. 调用模型
-    let response = router.chat(messages, None).await?;
+    let request = Request::new("deepseek-chat", messages);
+    let response = router.chat(request).await?;
 
     if let Message::Assistant { content, .. } = response {
         println!("{}", content);
@@ -118,9 +118,9 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 use futures::StreamExt;
 use alaya_agent::{
-    providers::openrouter_provider_from_env,
+    providers::{Request, openrouter_provider_from_env},
     router::{ChatCapability, ModelCapability, ModelRouter},
-    core::Message,
+    Message,
 };
 use std::sync::Arc;
 
@@ -131,10 +131,15 @@ async fn main() -> anyhow::Result<()> {
     let provider = Arc::new(openrouter_provider_from_env()?);
     let mut router = ModelRouter::new();
     router.add_model_provider("google/gemini-3-pro-preview", provider, &[ModelCapability::Chat]);
-    router.set_active_model(ModelCapability::Chat, "google/gemini-3-pro-preview")?;
 
     let mut stream = router
-        .chat_stream(vec![Message::user("从 1 数到 5")], None)
+        .chat_stream(
+            Request::new(
+                "google/gemini-3-pro-preview",
+                vec![Message::user("从 1 数到 5")],
+            )
+            .with_stream(true),
+        )
         .await?;
 
     while let Some(chunk) = stream.next().await {
@@ -154,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
 use alaya_agent::{
     agent::{AgentActorBuilder, GenericToolExecutor, register_select_tools},
     context::{Context, Layer, LayerKind},
-    providers::deepseek_provider_from_env,
+    providers::{Request, deepseek_provider_from_env},
     router::{ModelCapability, ModelRouter},
     select::SelectToolConfig,
 };
@@ -168,7 +173,6 @@ async fn main() -> anyhow::Result<()> {
     let provider = Arc::new(deepseek_provider_from_env()?);
     let mut router = ModelRouter::new();
     router.add_model_provider("deepseek-chat", provider, &[ModelCapability::Chat]);
-    router.set_active_model(ModelCapability::Chat, "deepseek-chat")?;
 
     // 工具执行器（注册文件操作工具）
     let mut executor = GenericToolExecutor::new();
@@ -182,7 +186,8 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // 构建 Agent
-    let agent = AgentActorBuilder::new(router, executor)
+    let chat_request = Request::new("deepseek-chat", Vec::new()).with_stream(true);
+    let agent = AgentActorBuilder::new(router, chat_request, executor)
         .context(ctx)
         .max_iterations(20)
         .build();
