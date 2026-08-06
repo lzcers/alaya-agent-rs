@@ -127,6 +127,10 @@ impl Conversation {
         &self.messages
     }
 
+    pub fn messages_mut(&mut self) -> &mut Vec<Message> {
+        &mut self.messages
+    }
+
     pub fn push(&mut self, message: Message) {
         self.messages.push(message);
     }
@@ -135,30 +139,37 @@ impl Conversation {
         self.usage.record(usage);
     }
 
-    pub fn compact_if_needed(&mut self, checkpoint: String) -> bool {
+    /// 如果消息数量或字符数超过阈值，执行压缩并返回压缩前的快照。
+    ///
+    /// 调用方可在后续操作失败时使用 `restore_history` 回滚到压缩前状态。
+    pub fn compact_if_needed(&mut self) -> Option<ConversationSnapshot> {
         let chars = self
             .messages
             .iter()
             .map(|message| message.content().chars().count())
             .sum::<usize>();
         if self.messages.len() < self.max_messages && chars < self.max_chars {
-            return false;
+            return None;
         }
+        let snapshot = ConversationSnapshot {
+            epoch: self.epoch,
+            messages: self.messages.clone(),
+            usage: self.usage,
+        };
         let system_message = self
             .messages
             .first()
             .cloned()
             .expect("conversation must start with a system message");
         self.epoch += 1;
-        let messages = vec![
+        self.messages = vec![
             system_message,
             Message::user(format!(
-                "{{\"type\":\"conversation_epoch_checkpoint\",\"epoch\":{}}}\n{}",
-                self.epoch, checkpoint
+                "{{\"type\":\"conversation_epoch_checkpoint\",\"epoch\":{}}}",
+                self.epoch
             )),
         ];
-        self.messages = messages;
-        true
+        Some(snapshot)
     }
 }
 
