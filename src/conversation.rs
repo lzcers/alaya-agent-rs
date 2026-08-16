@@ -123,6 +123,14 @@ impl Conversation {
         self.usage = CacheUsageTotals::default();
     }
 
+    /// 仅清零用量累计，保留消息与压缩轮次。
+    ///
+    /// 用于「每 commit 存当轮增量」的口径：恢复历史时只回填 messages，当前轮用量从零起算；
+    /// 模型调用后将当轮 usage 通过 [`Self::record_usage`] 累加，落库即当轮增量。
+    pub fn reset_usage(&mut self) {
+        self.usage = CacheUsageTotals::default();
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
