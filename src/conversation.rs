@@ -131,6 +131,19 @@ impl Conversation {
         self.usage = CacheUsageTotals::default();
     }
 
+    /// 仅截断消息到 system 并清零压缩轮次，但保留 usage 累计（不同于 [`Self::reset`]）。
+    ///
+    /// 用于无状态重试：每次重试只注入新的 user 输入（feedback 已并入其中），模型不再看到
+    /// 先前失败的输出；快照 messages 只含最终一次交换，usage 仍覆盖本轮全部尝试。
+    pub fn reset_messages(&mut self) {
+        debug_assert!(matches!(
+            self.messages.first(),
+            Some(Message::System { .. })
+        ));
+        self.messages.truncate(1);
+        self.epoch = 0;
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -245,5 +258,29 @@ mod tests {
         assert_eq!(restored.messages, vec![Message::system("system")]);
         assert_eq!(restored.usage.requests, 1);
         assert_eq!(restored.usage.prompt_tokens, 10);
+    }
+
+    #[test]
+    fn reset_messages_truncates_to_system_but_keeps_usage() {
+        let mut conversation =
+            Conversation::new("system".to_string(), ConversationConfig::default());
+        conversation.push(Message::user("attempt one"));
+        conversation.push(Message::assistant("failed output"));
+        conversation.record_usage(Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            prompt_cache_hit_tokens: Some(4),
+            prompt_cache_miss_tokens: Some(6),
+        }));
+
+        conversation.reset_messages();
+
+        let snapshot = conversation.snapshot();
+        assert_eq!(snapshot.messages, vec![Message::system("system")]);
+        assert_eq!(snapshot.epoch, 0);
+        assert_eq!(snapshot.usage.requests, 1);
+        assert_eq!(snapshot.usage.prompt_tokens, 10);
+        assert_eq!(snapshot.usage.completion_tokens, 2);
     }
 }
