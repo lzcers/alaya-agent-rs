@@ -1,10 +1,18 @@
-//! Model-agnostic conversation state, persistence, and compaction.
+//! Model-agnostic conversation state for one-shot agent calls.
+//!
+//! 每次 agent 调用构造一个 Conversation（以 system 开头），推入当轮 user 后交模型补全，
+//! 再把 assistant 拼回并累计当轮 usage；快照 {epoch, usage, messages} 落库作为审计记录。
+//! 压缩机制已移除：跨轮历史由各 agent 的结构化上下文注入，conversation 不再跨轮累积，
+//! epoch 恒为 0（字段保留以兼容已持久化的快照）。
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Message, Usage};
 
-/// Conversation compaction thresholds.
+/// Conversation 构造配置。
+///
+/// max_messages / max_chars 原为历史压缩阈值；压缩机制已移除，阈值不再生效，
+/// 保留该配置仅为兼容现有构造调用与持久化配置。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "snake_case")]
 pub struct ConversationConfig {
@@ -51,27 +59,31 @@ impl CacheUsageTotals {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct ConversationSnapshot {
+    /// 压缩轮数；压缩机制已移除，恒为 0，保留字段以兼容已持久化的快照。
     pub epoch: u64,
     pub messages: Vec<Message>,
     pub usage: CacheUsageTotals,
 }
 
+/// 一次 agent 调用的消息集合与用量累计。
+///
+/// 仅承载单次调用：以 system 开头，推入当轮 user，模型返回后拼回 assistant 并记录
+/// usage。不再跨调用累积（历史由各 agent 的结构化上下文注入）。
 pub struct Conversation {
     messages: Vec<Message>,
     usage: CacheUsageTotals,
-    epoch: u64, // 压缩了多少轮
-    max_messages: usize,
-    max_chars: usize,
+    epoch: u64,
 }
 
 impl Conversation {
-    pub fn new(system_prompt: String, config: ConversationConfig) -> Self {
+    /// 以 system 提示词开头构造一次全新调用。
+    ///
+    /// config 的阈值字段在压缩移除后不再生效，仅为兼容构造签名保留。
+    pub fn new(system_prompt: String, _config: ConversationConfig) -> Self {
         Self {
             messages: vec![Message::system(system_prompt)],
-            max_messages: config.max_messages,
-            max_chars: config.max_chars,
-            epoch: 0,
             usage: CacheUsageTotals::default(),
+            epoch: 0,
         }
     }
 
@@ -83,36 +95,9 @@ impl Conversation {
         }
     }
 
-    pub fn from_snapshot(
-        config: ConversationConfig,
-        snapshot: ConversationSnapshot,
-    ) -> Result<Self, String> {
-        validate_snapshot(&snapshot)?;
-        Ok(Self {
-            max_messages: config.max_messages,
-            max_chars: config.max_chars,
-            epoch: snapshot.epoch,
-            messages: snapshot.messages,
-            usage: snapshot.usage,
-        })
-    }
-
-    pub fn restore(&mut self, snapshot: ConversationSnapshot) -> Result<(), String> {
-        validate_snapshot(&snapshot)?;
-        self.epoch = snapshot.epoch;
-        self.messages = snapshot.messages;
-        self.usage = snapshot.usage;
-        Ok(())
-    }
-
-    /// Restores conversation history while retaining usage already incurred by the current run.
-    pub fn restore_history(&mut self, snapshot: ConversationSnapshot) -> Result<(), String> {
-        validate_snapshot(&snapshot)?;
-        self.epoch = snapshot.epoch;
-        self.messages = snapshot.messages;
-        Ok(())
-    }
-
+    /// 截断消息到 system 并清零用量与压缩轮次。
+    ///
+    /// 用于 fate_weaver：每次 advance 从当轮上下文开始，不跨 commit 累积。
     pub fn reset(&mut self) {
         debug_assert!(matches!(
             self.messages.first(),
@@ -123,18 +108,10 @@ impl Conversation {
         self.usage = CacheUsageTotals::default();
     }
 
-    /// 仅清零用量累计，保留消息与压缩轮次。
+    /// 仅截断消息到 system，但保留 usage 累计（不同于 Self::reset）。
     ///
-    /// 用于「每 commit 存当轮增量」的口径：恢复历史时只回填 messages，当前轮用量从零起算；
-    /// 模型调用后将当轮 usage 通过 [`Self::record_usage`] 累加，落库即当轮增量。
-    pub fn reset_usage(&mut self) {
-        self.usage = CacheUsageTotals::default();
-    }
-
-    /// 仅截断消息到 system 并清零压缩轮次，但保留 usage 累计（不同于 [`Self::reset`]）。
-    ///
-    /// 用于无状态重试：每次重试只注入新的 user 输入（feedback 已并入其中），模型不再看到
-    /// 先前失败的输出；快照 messages 只含最终一次交换，usage 仍覆盖本轮全部尝试。
+    /// 用于无状态重试：每次重试只注入新的 user 输入（feedback 已并入其中），模型不再
+    /// 看到先前失败的输出；快照 messages 只含最终一次交换，usage 仍覆盖本轮全部尝试。
     pub fn reset_messages(&mut self) {
         debug_assert!(matches!(
             self.messages.first(),
@@ -148,57 +125,12 @@ impl Conversation {
         &self.messages
     }
 
-    pub fn messages_mut(&mut self) -> &mut Vec<Message> {
-        &mut self.messages
-    }
-
     pub fn push(&mut self, message: Message) {
         self.messages.push(message);
     }
 
     pub fn record_usage(&mut self, usage: Option<Usage>) {
         self.usage.record(usage);
-    }
-
-    /// 如果消息数量或字符数超过阈值，执行压缩并返回压缩前的快照。
-    ///
-    /// 调用方可在后续操作失败时使用 `restore_history` 回滚到压缩前状态。
-    pub fn compact_if_needed(&mut self) -> Option<ConversationSnapshot> {
-        let chars = self
-            .messages
-            .iter()
-            .map(|message| message.content().chars().count())
-            .sum::<usize>();
-        if self.messages.len() < self.max_messages && chars < self.max_chars {
-            return None;
-        }
-        let snapshot = ConversationSnapshot {
-            epoch: self.epoch,
-            messages: self.messages.clone(),
-            usage: self.usage,
-        };
-        let system_message = self
-            .messages
-            .first()
-            .cloned()
-            .expect("conversation must start with a system message");
-        self.epoch += 1;
-        self.messages = vec![
-            system_message,
-            Message::user(format!(
-                "{{\"type\":\"conversation_epoch_checkpoint\",\"epoch\":{}}}",
-                self.epoch
-            )),
-        ];
-        Some(snapshot)
-    }
-}
-
-fn validate_snapshot(snapshot: &ConversationSnapshot) -> Result<(), String> {
-    if matches!(snapshot.messages.first(), Some(Message::System { .. })) {
-        Ok(())
-    } else {
-        Err("conversation snapshot must start with a system message".to_string())
     }
 }
 
@@ -207,43 +139,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reset_preserves_the_snapshot_system_message() {
-        let mut conversation = Conversation::new(
-            "constructor prompt".to_string(),
-            ConversationConfig::default(),
-        );
-        conversation
-            .restore(ConversationSnapshot {
-                epoch: 7,
-                messages: vec![
-                    Message::system("snapshot prompt"),
-                    Message::user("previous turn"),
-                ],
-                usage: CacheUsageTotals {
-                    requests: 1,
-                    ..CacheUsageTotals::default()
-                },
-            })
-            .unwrap();
-
-        conversation.reset();
-
-        assert_eq!(
-            conversation.snapshot(),
-            ConversationSnapshot {
-                epoch: 0,
-                messages: vec![Message::system("snapshot prompt")],
-                usage: CacheUsageTotals::default(),
-            }
-        );
-    }
-
-    #[test]
-    fn restore_history_preserves_usage() {
+    fn one_shot_call_records_a_single_exchange_and_usage() {
         let mut conversation =
             Conversation::new("system".to_string(), ConversationConfig::default());
-        let snapshot = conversation.snapshot();
-        conversation.push(Message::user("uncommitted"));
+        conversation.push(Message::user("turn"));
+        conversation.push(Message::assistant("answer"));
         conversation.record_usage(Some(Usage {
             prompt_tokens: 10,
             completion_tokens: 2,
@@ -252,12 +152,35 @@ mod tests {
             prompt_cache_miss_tokens: Some(6),
         }));
 
-        conversation.restore_history(snapshot).unwrap();
+        let snapshot = conversation.snapshot();
+        assert_eq!(snapshot.epoch, 0);
+        assert_eq!(
+            snapshot.messages,
+            vec![
+                Message::system("system"),
+                Message::user("turn"),
+                Message::assistant("answer"),
+            ]
+        );
+        assert_eq!(snapshot.usage.requests, 1);
+        assert_eq!(snapshot.usage.prompt_tokens, 10);
+    }
 
-        let restored = conversation.snapshot();
-        assert_eq!(restored.messages, vec![Message::system("system")]);
-        assert_eq!(restored.usage.requests, 1);
-        assert_eq!(restored.usage.prompt_tokens, 10);
+    #[test]
+    fn reset_preserves_the_system_message() {
+        let mut conversation = Conversation::new(
+            "constructor prompt".to_string(),
+            ConversationConfig::default(),
+        );
+        conversation.push(Message::user("previous turn"));
+
+        conversation.reset();
+
+        assert_eq!(
+            conversation.snapshot().messages,
+            vec![Message::system("constructor prompt")]
+        );
+        assert_eq!(conversation.snapshot().usage, CacheUsageTotals::default());
     }
 
     #[test]
