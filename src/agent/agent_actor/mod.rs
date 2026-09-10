@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::{AgentState, Context, Metrics, ToolExecutor};
-use crate::{providers::Request, router::ChatCapability};
+use crate::capability::{ChatCapability, ChatRequest};
 
 pub use builder::AgentActorBuilder;
 pub use loop_control::LoopState;
@@ -33,7 +33,7 @@ where
     /// Chat 模型
     chat: Arc<C>,
     /// 每次 step 使用的 Chat 请求配置；messages 和 tools 会在调用前刷新。
-    chat_request: Request,
+    chat_request: ChatRequest,
     /// 工具执行器
     tool_executor: Arc<E>,
     /// 等待中的用户输入
@@ -46,14 +46,14 @@ where
     E: ToolExecutor + Send,
 {
     /// 创建新的 Agent Actor
-    pub fn new(chat: C, chat_request: Request, tool_executor: E, context: Context) -> Self {
+    pub fn new(chat: C, chat_request: ChatRequest, tool_executor: E, context: Context) -> Self {
         Self::with_runtime_hooks(chat, chat_request, tool_executor, context)
     }
 
     /// 创建带内部 runtime hooks 和扩展 hooks 的 Agent Actor
     pub(crate) fn with_runtime_hooks(
         chat: C,
-        chat_request: Request,
+        chat_request: ChatRequest,
         tool_executor: E,
         context: Context,
     ) -> Self {

@@ -4,9 +4,9 @@ use crate::agent::{
     Tool, ToolCall, ToolCallFunction, ToolDef, ToolExecutorError,
 };
 
-use crate::providers::Request;
-use crate::providers::deepseek_provider_from_env;
-use crate::router::{ChatCapability, ChatChunk, ModelCapability, ModelRouter, RouterError};
+use crate::capability::{ChatCapability, ChatChunk, ChatRequest, ModelError};
+use crate::endpoints::deepseek_from_env;
+use crate::router::ModelRouter;
 use crate::{Message, Usage};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -91,14 +91,14 @@ struct MockChatModel {
 
 #[async_trait]
 impl ChatCapability for MockChatModel {
-    async fn chat(&self, _request: Request) -> Result<Message, RouterError> {
+    async fn chat(&self, _request: ChatRequest) -> Result<Message, ModelError> {
         panic!("chat should not be called in this test");
     }
 
     async fn chat_stream(
         &self,
-        _request: Request,
-    ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, ChatChunk>, ModelError> {
         Ok(Box::pin(stream::iter(self.chunks.clone())))
     }
 }
@@ -148,7 +148,7 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
     print_test_banner("AgentActor DeepSeek + Playwright Test");
 
     // 1. 创建 DeepSeek Provider
-    let provider = match deepseek_provider_from_env() {
+    let provider = match deepseek_from_env() {
         Ok(p) => Arc::new(p),
         Err(_) => {
             print_section("Skipped");
@@ -159,7 +159,7 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
 
     // 2. 创建 ModelRouter
     let mut model = ModelRouter::new();
-    model.add_model_provider("deepseek-reasoner", provider, &[ModelCapability::Chat]);
+    model.add_chat_model("deepseek-reasoner", provider);
 
     // 3. 创建工具执行器并注册真实的 Playwright 工具
     let mut executor = GenericToolExecutor::new();
@@ -183,7 +183,7 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
     // 5. 创建 AgentActo
     let actor = AgentActor::new(
         model,
-        Request::new("deepseek-reasoner", Vec::new()).with_stream(true),
+        ChatRequest::new("deepseek-reasoner", Vec::new()),
         executor,
         context,
     );
@@ -377,7 +377,7 @@ async fn test_agent_actor_accumulates_usage_from_stream_response() {
 
     let mut actor = AgentActor::new(
         model,
-        Request::new("mock-model", Vec::new()).with_stream(true),
+        ChatRequest::new("mock-model", Vec::new()),
         executor,
         context,
     );
@@ -428,7 +428,7 @@ async fn test_agent_actor_emits_step_frame_metrics_to_upper_layer() {
 
     let mut actor = AgentActor::new(
         model,
-        Request::new("mock-model", Vec::new()).with_stream(true),
+        ChatRequest::new("mock-model", Vec::new()),
         executor,
         context,
     );
@@ -477,7 +477,7 @@ async fn test_agent_actor_records_error_metrics_when_max_iterations_exceeded() {
 
     let mut actor = AgentActor::new(
         model,
-        Request::new("mock-model", Vec::new()).with_stream(true),
+        ChatRequest::new("mock-model", Vec::new()),
         executor,
         context,
     );

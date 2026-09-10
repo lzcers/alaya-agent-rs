@@ -6,14 +6,11 @@ use thiserror::Error;
 use crate::Message;
 use crate::agent::memory::MemoryError;
 use crate::agent::{Layer, LayerKind};
-use crate::{
-    providers::Request,
-    router::{ChatCapability, RouterError},
-};
+use crate::capability::{ChatCapability, ChatRequest, ModelError};
 
 #[async_trait]
 pub trait SummaryModel: Send + Sync {
-    async fn summarize(&self, prompt: &str) -> Result<String, RouterError>;
+    async fn summarize(&self, prompt: &str) -> Result<String, ModelError>;
 }
 
 const DEFAULT_SUMMARY_LAYER_NAME: &str = "conversation_summary";
@@ -32,8 +29,8 @@ pub enum CompressionError {
     Serde(#[from] serde_json::Error),
     #[error("memory error: {0}")]
     Memory(#[from] MemoryError),
-    #[error("router error: {0}")]
-    Router(#[from] RouterError),
+    #[error("model error: {0}")]
+    Model(#[from] ModelError),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -157,12 +154,12 @@ impl Default for ModelCompression {
 
 pub struct ChatSummaryModel<'a, C> {
     chat: &'a C,
-    request: Request,
+    request: ChatRequest,
     system_prompt: String,
 }
 
 impl<'a, C> ChatSummaryModel<'a, C> {
-    pub fn new(chat: &'a C, request: Request) -> Self {
+    pub fn new(chat: &'a C, request: ChatRequest) -> Self {
         Self {
             chat,
             request,
@@ -181,7 +178,7 @@ impl<C> SummaryModel for ChatSummaryModel<'_, C>
 where
     C: ChatCapability + Send + Sync,
 {
-    async fn summarize(&self, prompt: &str) -> Result<String, RouterError> {
+    async fn summarize(&self, prompt: &str) -> Result<String, ModelError> {
         let response = self
             .chat
             .chat(self.request.clone().with_messages(vec![
@@ -192,7 +189,7 @@ where
 
         match response {
             Message::Assistant { content, .. } if !content.trim().is_empty() => Ok(content),
-            _ => Err(RouterError::NoResponse),
+            _ => Err(ModelError::NoResponse),
         }
     }
 }

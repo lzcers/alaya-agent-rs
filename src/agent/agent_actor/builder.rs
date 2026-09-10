@@ -1,6 +1,6 @@
 use super::AgentActor;
 use crate::agent::{Context, ToolExecutor};
-use crate::{providers::Request, router::ChatCapability};
+use crate::capability::{ChatCapability, ChatRequest};
 
 /// Agent Actor 构建器
 pub struct AgentActorBuilder<C, E>
@@ -9,7 +9,7 @@ where
     E: ToolExecutor + Send + 'static,
 {
     chat: C,
-    chat_request: Request,
+    chat_request: ChatRequest,
     tool_executor: E,
     context: Context,
     max_iterations: usize,
@@ -22,7 +22,7 @@ where
     E: ToolExecutor + Send + 'static,
 {
     /// 创建新的构建器
-    pub fn new(chat: C, chat_request: Request, tool_executor: E) -> Self {
+    pub fn new(chat: C, chat_request: ChatRequest, tool_executor: E) -> Self {
         Self {
             chat,
             chat_request,

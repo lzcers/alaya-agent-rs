@@ -3,13 +3,14 @@
 > "What I cannot create, I do not understand."  
 > —— Richard Feynman
 
-一个用 Rust 编写的 LLM Agent 框架，从零实现了 Provider、Model Router、Tool、Context、Lifecycle Hook 等核心组件。
+一个用 Rust 编写的 LLM Agent 框架，从零实现了传输层、协议层、能力层、Model Router、Tool、Context、Lifecycle Hook 等核心组件。
 
 ## 特性
 
-- **OpenAI 兼容的 Provider 抽象** —— 内置 DeepSeek、OpenRouter 适配器，支持任何兼容 OpenAI API 的服务
+- **四层模型调用栈** —— 传输层（HTTP 协议动词）/ 协议层（wire ↔ 域映射）/ 能力层（域接口）/ 分发层（模型名路由）各司其职
+- **OpenAI 兼容协议适配器** —— 内置 DeepSeek、OpenRouter 构造函数，支持任何兼容 OpenAI API 的服务
 - **流式 SSE 解析** —— 手写的 SSE 帧解析器，正确处理跨 chunk 边界的多字节字符和增量 tool call 合并
-- **多模态路由** —— 按能力（Chat / Image / Audio）独立路由到不同 provider 和模型
+- **多模态路由** —— 按能力（Chat / Image / Audio）独立路由到不同实现和模型
 - **分层上下文** —— System / Soul / User / Memory / Conversation / Custom 层，按优先级排序，支持合并与序列化
 - **生命周期 Hook 系统** —— 7 个阶段（BeforeStep → BeforeCallModel → OnModelEvent → AfterCallModel → BeforeCallTools → AfterCallTools → AfterStep），可插拔扩展
 - **工具调用** —— 并行执行、超时控制、JSON Schema 参数定义、自动注册
@@ -21,13 +22,13 @@
 ## 架构
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    AgentActor                        │
-│  ┌───────────┐  ┌──────────────┐  ┌──────────────┐  │
-│  │  Context   │  │ AgentState   │  │   Metrics    │  │
-│  │ (分层上下文) │  │ (状态 + 指标) │  │ (运行统计)    │  │
-│  └───────────┘  └──────────────┘  └──────────────┘  │
-│         │                                           │
+┌──────────────────────────────────────────────────────┐
+│                     AgentActor                        │
+│  ┌───────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │  Context   │  │ AgentState   │  │   Metrics    │   │
+│  │ (分层上下文) │  │ (状态 + 指标) │  │ (运行统计)    │   │
+│  └───────────┘  └──────────────┘  └──────────────┘   │
+│         │                                            │
 │    ┌────▼─────────────────────────────┐              │
 │    │       StepLifeCycle (7 阶段)      │              │
 │    │  BeforeStep → BeforeCallModel     │              │
@@ -36,25 +37,41 @@
 │    │  → AfterStep                       │              │
 │    └────┬──────────────┬───────────────┘              │
 │         │              │                              │
-│    ┌────▼────┐   ┌────▼─────┐                        │
-│    │ ChatCap  │   │ToolExec  │                        │
-│    │ (模型)   │   │ (工具)    │                        │
-│    └────┬────┘   └──────────┘                        │
-└─────────┼───────────────────────────────────────────┘
+│    ┌────▼────┐   ┌────▼─────┐                         │
+│    │ChatCap  │   │ToolExec  │                         │
+│    │(域接口) │   │ (工具)    │                         │
+│    └────┬────┘   └──────────┘                         │
+└─────────┼────────────────────────────────────────────┘
           │
-    ┌─────▼─────┐
-    │ModelRouter │  ──→  Chat / Image / Audio
-    └─────┬─────┘
+    ┌─────▼──────┐
+    │ModelRouter │  分发层：按 (能力, 模型名) 查表转发
+    └─────┬──────┘
           │
-    ┌─────▼──────────────────────────┐
-    │         Provider               │
-    │  ┌────────────┐ ┌───────────┐  │
-    │  │ DeepSeek   │ │OpenRouter │  │
-    │  │ (OpenAI    │ │(OpenAI    │  │
-    │  │ Compatible)│ │Compatible)│  │
-    │  └────────────┘ └───────────┘  │
-    └────────────────────────────────┘
+    ┌─────▼───────────────────────────┐
+    │  协议层（协议是 (端点,能力) 的属性）│
+    │  OpenAiCompatible  /chat/…       │  → Chat / Audio
+    │  OpenRouterImages  /images       │  → Image
+    └─────┬───────────────────────────┘
+          │
+    ┌─────▼───────────────────────────┐
+    │  Provider (post_json / post_sse) │  传输层：URL / 认证 / 超时 / 代理 / SSE 分帧
+    │      → HttpProvider (reqwest)    │
+    └──────────────────────────────────┘
 ```
+
+各层职责与依赖方向：
+
+| 层 | 模块 | 知道什么 | 不知道什么 |
+|----|------|----------|------------|
+| 传输层 | `providers` | URL、认证、超时、代理、SSE 分帧、HTTP 错误 | 任何业务操作（没有 `chat` / `generate_image` 方法） |
+| 协议层 | `protocols` | 端点路径、wire 结构体、厂商字段编码 | 模型名怎么路由、`base_url` |
+| 端点 | `endpoints` | `base_url`、默认请求头、厂商命名 | 协议形状、模型路由 |
+| 能力层 | `capability` | 域接口与域类型（`ChatRequest`、`ChatChunk`、`GenImgResponse`……） | HTTP、JSON 形状 |
+| 分发层 | `router` | 模型名 → 能力实现的映射 | 协议细节 |
+
+`protocols` 里只有协议：DeepSeek 与 OpenRouter 的 chat/audio 都走 OpenAI 兼容协议，只有 OpenRouter 的图片端点走它自有的统一 schema。厂商的 `base_url` 与默认请求头属于端点配置，放在 `endpoints`。
+
+新增一种能力（embeddings、rerank、TTS……）只需在 `capability` 加一个 trait、在 `protocols` 加一个实现，传输层与分发层不用改。
 
 ## 快速开始
 
@@ -70,9 +87,10 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust
 use alaya_agent::{
-    context::{Context, Layer, LayerKind},
-    providers::{Request, deepseek_provider_from_env},
-    router::{ChatCapability, ModelCapability, ModelRouter},
+    agent::{Context, Layer, LayerKind},
+    capability::{ChatCapability, ChatRequest},
+    endpoints::deepseek_from_env,
+    router::ModelRouter,
     Message,
 };
 use std::sync::Arc;
@@ -81,12 +99,12 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    // 1. 创建 Provider
-    let provider = Arc::new(deepseek_provider_from_env()?);
+    // 1. 创建端点（内部组装传输 + 协议）
+    let model = Arc::new(deepseek_from_env()?);
 
-    // 2. 配置模型路由
+    // 2. 注册 chat 能力
     let mut router = ModelRouter::new();
-    router.add_model_provider("deepseek-chat", provider, &[ModelCapability::Chat]);
+    router.add_chat_model("deepseek-chat", model);
 
     // 3. 构建上下文
     let ctx = Context::new().layer(Layer::new(
@@ -102,8 +120,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 4. 调用模型
-    let request = Request::new("deepseek-chat", messages);
-    let response = router.chat(request).await?;
+    let response = router
+        .chat(ChatRequest::new("deepseek-chat", messages))
+        .await?;
 
     if let Message::Assistant { content, .. } = response {
         println!("{}", content);
@@ -118,8 +137,9 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 use futures::StreamExt;
 use alaya_agent::{
-    providers::{Request, openrouter_provider_from_env},
-    router::{ChatCapability, ModelCapability, ModelRouter},
+    capability::{ChatCapability, ChatRequest},
+    endpoints::openrouter_from_env,
+    router::ModelRouter,
     Message,
 };
 use std::sync::Arc;
@@ -128,18 +148,15 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    let provider = Arc::new(openrouter_provider_from_env()?);
+    let model = Arc::new(openrouter_from_env()?);
     let mut router = ModelRouter::new();
-    router.add_model_provider("google/gemini-3-pro-preview", provider, &[ModelCapability::Chat]);
+    router.add_chat_model("google/gemini-3-pro-preview", model);
 
     let mut stream = router
-        .chat_stream(
-            Request::new(
-                "google/gemini-3-pro-preview",
-                vec![Message::user("从 1 数到 5")],
-            )
-            .with_stream(true),
-        )
+        .chat_stream(ChatRequest::new(
+            "google/gemini-3-pro-preview",
+            vec![Message::user("从 1 数到 5")],
+        ))
         .await?;
 
     while let Some(chunk) = stream.next().await {
@@ -153,14 +170,45 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### 图片 / 音频生成
+
+```rust
+use alaya_agent::{
+    capability::{GenAudioCapability, GenAudioRequest, GenImgCapability, GenImgRequest},
+    endpoints::openrouter_from_env,
+    router::ModelRouter,
+};
+use std::sync::Arc;
+
+let model = Arc::new(openrouter_from_env()?);
+let mut router = ModelRouter::new();
+router.add_image_model("black-forest-labs/flux.2-klein-4b", model.clone());
+router.add_audio_model("google/lyria-3-clip-preview", model);
+
+// 图片：返回值已统一成 URL（远程地址或 data: 内联数据）
+let image = router
+    .gen_img(
+        GenImgRequest::new("black-forest-labs/flux.2-klein-4b", "日落下的山峦")
+            .with_aspect_ratio("16:9")
+            .with_resolution("1K"),
+    )
+    .await?;
+
+// 音频：域请求只表达意图，modalities / audio 字段由协议层负责编码
+let audio = router
+    .gen_audio(GenAudioRequest::new("google/lyria-3-clip-preview", "一段轻快的钢琴循环").with_format("wav"))
+    .await?;
+```
+
 ### Agent 循环 + 工具调用
 
 ```rust
 use alaya_agent::{
     agent::{AgentActorBuilder, GenericToolExecutor, register_select_tools},
-    context::{Context, Layer, LayerKind},
-    providers::{Request, deepseek_provider_from_env},
-    router::{ModelCapability, ModelRouter},
+    agent::{Context, Layer, LayerKind},
+    capability::ChatRequest,
+    endpoints::deepseek_from_env,
+    router::ModelRouter,
     select::SelectToolConfig,
 };
 use std::sync::Arc;
@@ -169,10 +217,10 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    // Provider + Router
-    let provider = Arc::new(deepseek_provider_from_env()?);
+    // 协议适配器 + Router
+    let model = Arc::new(deepseek_from_env()?);
     let mut router = ModelRouter::new();
-    router.add_model_provider("deepseek-chat", provider, &[ModelCapability::Chat]);
+    router.add_chat_model("deepseek-chat", model);
 
     // 工具执行器（注册文件操作工具）
     let mut executor = GenericToolExecutor::new();
@@ -186,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // 构建 Agent
-    let chat_request = Request::new("deepseek-chat", Vec::new()).with_stream(true);
+    let chat_request = ChatRequest::new("deepseek-chat", Vec::new());
     let agent = AgentActorBuilder::new(router, chat_request, executor)
         .context(ctx)
         .max_iterations(20)
@@ -221,13 +269,50 @@ handle.resume().await;
 handle.cancel().await;
 ```
 
+### 自定义传输
+
+`providers::Provider` 只有两个协议动词，实现它就能把模型调用接到任意 HTTP 栈上
+（测试替身、录制回放、自定义中间件）：
+
+```rust
+use alaya_agent::providers::{Provider, ProviderError};
+use futures::stream::BoxStream;
+use serde_json::Value;
+
+struct MyTransport;
+
+#[async_trait::async_trait]
+impl Provider for MyTransport {
+    async fn post_json(&self, path: &str, body: Value) -> Result<Value, ProviderError> {
+        // POST base_url + path
+        todo!()
+    }
+
+    async fn post_sse(
+        &self,
+        path: &str,
+        body: Value,
+    ) -> Result<BoxStream<'static, Result<String, ProviderError>>, ProviderError> {
+        // POST 后把响应体切成 SSE 事件的 data 载荷
+        todo!()
+    }
+
+    fn name(&self) -> &str {
+        "my-transport"
+    }
+}
+```
+
 ## 模块说明
 
 | 模块 | 说明 |
 |------|------|
-| `core` | 核心类型：`Message`、`Usage`、`MessageRole` |
-| `providers` | LLM API Provider 抽象，`OpenAICompatibleProvider` 通用实现，DeepSeek / OpenRouter 适配器 |
-| `router` | `ModelRouter` 按 Chat / Image / Audio 能力路由到不同模型和 Provider |
+| `message` / `usage` | 核心域类型：`Message`、`MessageRole`、`Usage` |
+| `capability` | 能力层：`ChatCapability` / `GenImgCapability` / `GenAudioCapability` 及域请求/响应类型、`ModelError` |
+| `protocols` | 协议层：`OpenAiCompatible`（OpenAI 兼容 chat/audio）、`OpenRouterImages`（OpenRouter 图片 API） |
+| `endpoints` | 端点预设：`deepseek` / `openrouter` 构造函数（`base_url` + 默认请求头），把能力接到正确的协议上 |
+| `providers` | 传输层：`Provider` trait（`post_json` / `post_sse` / `name`）与 `HttpProvider` 实现、`ProviderError` |
+| `router` | 分发层：`ModelRouter` 按 (能力, 模型名) 查表转发 |
 | `agent::context` | 分层上下文容器 `Context`，支持 System / Soul / User / Memory / Conversation / Custom 层 |
 | `agent::agent_actor` | `AgentActor` 组合模型 + 工具，执行单步或后台循环；`AgentActorBuilder` 构建器 |
 | `agent::hooks` | 生命周期 Hook trait，内置 `ExecutionPolicyHook`、`MetricsHook`、`AskUserHook` 等 |

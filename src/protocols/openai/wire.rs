@@ -1,12 +1,20 @@
-use crate::MessageRole;
-use crate::agent::{ToolCall, ToolDef};
+//! OpenAI 兼容协议的 wire 结构体。
+//!
+//! 这里是「线上长什么样」的唯一真相：字段名、别名、容错解析、以及
+//! 域请求 → wire body 的翻译。域层不应该看见本模块的任何类型。
+
 use serde::de::{self, Unexpected};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Value, json};
-use std::collections::HashMap;
+use serde_json::Value;
 
-use async_trait::async_trait;
-use futures::stream::BoxStream;
+use crate::MessageRole;
+use crate::agent::ToolCall;
+use crate::capability::ChatRequest;
+use crate::message::Message;
+
+// ============================================================================
+// 容错反序列化
+// ============================================================================
 
 fn value_to_u32_lossy<E>(value: Value) -> Result<u32, E>
 where
@@ -74,33 +82,139 @@ where
     }
 }
 
-/// Provider trait - LLM API 提供商的统一接口
-#[async_trait]
-pub trait Provider: Send + Sync {
-    /// 发送非流式请求
-    async fn chat(&self, request: Request) -> Result<Response, ProviderError>;
+// ============================================================================
+// 请求
+// ============================================================================
 
-    /// 发送流式请求
-    async fn chat_stream(
-        &self,
-        request: Request,
-    ) -> Result<BoxStream<'static, StreamResponse>, ProviderError>;
+/// `POST /chat/completions` 的请求体。
+#[derive(Debug, Clone, Serialize)]
+pub struct WireChatRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<WireTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<WireResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<WireThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<WireStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<WireAudioConfig>,
+}
 
-    /// 使用 Provider 的独立图片生成端点。
-    ///
-    /// 默认实现保持现有自定义 Provider 兼容；支持图片的 Provider 应覆盖此方法。
-    async fn generate_image(
-        &self,
-        _request: ImageGenerationRequest,
-    ) -> Result<ImageGenerationResponse, ProviderError> {
-        Err(ProviderError::ApiError {
-            code: 501,
-            message: "image generation is not supported by this provider".to_string(),
-        })
+#[derive(Debug, Clone, Serialize)]
+pub struct WireTool {
+    #[serde(rename = "type")]
+    pub tool_type: &'static str,
+    pub function: WireToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WireToolFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WireResponseFormat {
+    #[serde(rename = "type")]
+    pub response_type: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WireThinking {
+    #[serde(rename = "type")]
+    pub thinking_type: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WireStreamOptions {
+    pub include_usage: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WireAudioConfig {
+    pub format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+}
+
+impl WireChatRequest {
+    fn base(model: impl Into<String>, messages: Vec<Message>) -> Self {
+        Self {
+            model: model.into(),
+            messages,
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: None,
+            reasoning_effort: None,
+            thinking: None,
+            stream_options: None,
+            modalities: None,
+            audio: None,
+        }
     }
+}
 
-    /// Provider 名称（用于日志和调试）
-    fn name(&self) -> &str;
+/// 域请求 → wire body。所有厂商私有字段的编码都发生在这里。
+impl From<&ChatRequest> for WireChatRequest {
+    fn from(request: &ChatRequest) -> Self {
+        let mut wire = Self::base(request.model.clone(), request.messages.clone());
+
+        wire.temperature = request.temperature;
+        wire.max_tokens = request.max_tokens;
+
+        if let Some(tools) = &request.tools {
+            wire.tools = Some(
+                tools
+                    .iter()
+                    .map(|def| WireTool {
+                        tool_type: "function",
+                        function: WireToolFunction {
+                            name: def.name.clone(),
+                            description: def.description.clone(),
+                            parameters: def.parameters.clone(),
+                        },
+                    })
+                    .collect(),
+            );
+        }
+
+        if request.response_format_json {
+            wire.response_format = Some(WireResponseFormat {
+                response_type: "json_object",
+            });
+        }
+
+        if request.include_usage {
+            wire.stream_options = Some(WireStreamOptions {
+                include_usage: true,
+            });
+        }
+
+        wire.reasoning_effort = request.reasoning.effort.clone();
+        if let Some(enabled) = request.reasoning.thinking {
+            wire.thinking = Some(WireThinking {
+                thinking_type: if enabled { "enabled" } else { "disabled" },
+            });
+        }
+
+        wire
+    }
 }
 
 // ============================================================================
@@ -110,7 +224,7 @@ pub trait Provider: Send + Sync {
 /// Token 使用统计
 /// 兼容 OpenAI 和 DeepSeek 的格式（prompt_tokens/input_tokens, completion_tokens/output_tokens）
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Usage {
+pub struct WireUsage {
     #[serde(alias = "input_tokens")]
     #[serde(deserialize_with = "deserialize_u32_lossy")]
     pub prompt_tokens: u32,
@@ -137,266 +251,43 @@ pub struct Usage {
     pub prompt_cache_miss_tokens: Option<u32>,
 }
 
-impl Usage {
+impl WireUsage {
     pub fn total(&self) -> u32 {
         self.total_tokens
             .unwrap_or(self.prompt_tokens + self.completion_tokens)
     }
 }
 
-// ============================================================================
-// 错误类型
-// ============================================================================
-
-#[derive(Debug)]
-pub enum ProviderError {
-    Request(reqwest::Error),
-    Serialization(serde_json::Error),
-    InvalidApiKey,
-    ApiError { code: u16, message: String },
-    MissingApiKey,
-    StreamError(String),
-}
-
-impl std::error::Error for ProviderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ProviderError::Request(e) => Some(e),
-            ProviderError::Serialization(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for ProviderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProviderError::Request(e) => write!(f, "Request error: {}", e),
-            ProviderError::Serialization(e) => write!(f, "Serialization error: {}", e),
-            ProviderError::InvalidApiKey => write!(f, "Invalid API key"),
-            ProviderError::ApiError { code, message } => {
-                write!(f, "API error {}: {}", code, message)
-            }
-            ProviderError::MissingApiKey => write!(f, "Missing API key"),
-            ProviderError::StreamError(msg) => write!(f, "Stream error: {}", msg),
-        }
-    }
-}
-
-impl From<reqwest::Error> for ProviderError {
-    fn from(e: reqwest::Error) -> Self {
-        ProviderError::Request(e)
-    }
-}
-
-impl From<serde_json::Error> for ProviderError {
-    fn from(e: serde_json::Error) -> Self {
-        ProviderError::Serialization(e)
-    }
-}
-
-// ============================================================================
-// 请求参数
-// ============================================================================
-
-/// 请求参数
-/// 基于 OpenAI 兼容格式，可扩展支持不同供应商的特有参数
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Request {
-    /// 模型名称
-    pub model: String,
-    /// 消息列表
-    pub messages: Vec<crate::Message>,
-    /// 是否使用流式输出
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
-    /// 控制随机性 (0-2)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    /// 最大 token 数
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    /// 扩展字段，用于供应商特有参数
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>,
-}
-
-impl Request {
-    pub fn new(model: impl Into<String>, messages: Vec<crate::Message>) -> Self {
+impl From<WireUsage> for crate::Usage {
+    fn from(value: WireUsage) -> Self {
         Self {
-            model: model.into(),
-            messages,
-            stream: None,
-            temperature: None,
-            max_tokens: None,
-            extra: HashMap::new(),
+            prompt_tokens: value.prompt_tokens,
+            completion_tokens: value.completion_tokens,
+            total_tokens: value.total(),
+            prompt_cache_hit_tokens: value.prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens: value.prompt_cache_miss_tokens,
         }
-    }
-
-    pub fn with_stream(mut self, stream: bool) -> Self {
-        self.stream = Some(stream);
-        self
-    }
-
-    pub fn with_messages(mut self, messages: Vec<crate::Message>) -> Self {
-        self.messages = messages;
-        self
-    }
-
-    pub fn with_temperature(mut self, temperature: f32) -> Self {
-        self.temperature = Some(temperature);
-        self
-    }
-
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = Some(max_tokens);
-        self
-    }
-
-    pub fn with_stream_usage(mut self, include_usage: bool) -> Self {
-        let stream_options = self
-            .extra
-            .entry("stream_options".to_string())
-            .or_insert_with(|| json!({}));
-
-        if let Some(options) = stream_options.as_object_mut() {
-            options.insert("include_usage".to_string(), json!(include_usage));
-        } else {
-            *stream_options = json!({ "include_usage": include_usage });
-        }
-
-        self
-    }
-
-    pub fn with_tools(mut self, tools: Option<Vec<ToolDef>>) -> Self {
-        if let Some(tools) = tools {
-            let tools: Vec<Value> = tools
-                .iter()
-                .map(|def| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": def.name,
-                            "description": def.description,
-                            "parameters": def.parameters,
-                        }
-                    })
-                })
-                .collect();
-            self.extra.insert("tools".to_string(), json!(tools));
-        }
-        self
-    }
-    pub fn with_response_format_json(mut self) -> Self {
-        self.extra.insert(
-            "response_format".to_string(),
-            json!({
-                "type": "json_object",
-            }),
-        );
-        self
-    }
-
-    pub fn with_reasoning_effort(mut self, reasoning_effort: impl Into<String>) -> Self {
-        self.extra.insert(
-            "reasoning_effort".to_string(),
-            json!(reasoning_effort.into()),
-        );
-        self
-    }
-
-    pub fn with_thinking(mut self, enabled: bool) -> Self {
-        self.extra.insert(
-            "thinking".to_string(),
-            json!({
-                "type": if enabled { "enabled" } else { "disabled" },
-            }),
-        );
-        self
-    }
-
-    pub fn with_audio(mut self, format: impl Into<String>, voice: Option<String>) -> Self {
-        let mut audio = serde_json::Map::new();
-        audio.insert("format".to_string(), json!(format.into()));
-        if let Some(voice) = voice {
-            audio.insert("voice".to_string(), json!(voice));
-        }
-        self.extra
-            .insert("modalities".to_string(), json!(["text", "audio"]));
-        self.extra.insert("audio".to_string(), Value::Object(audio));
-        self
     }
 }
 
 // ============================================================================
-// 图片生成请求与响应
-// ============================================================================
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageGenerationRequest {
-    pub model: String,
-    pub prompt: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aspect_ratio: Option<String>,
-}
-
-impl ImageGenerationRequest {
-    pub fn new(model: impl Into<String>, prompt: impl Into<String>) -> Self {
-        Self {
-            model: model.into(),
-            prompt: prompt.into(),
-            resolution: None,
-            aspect_ratio: None,
-        }
-    }
-
-    pub fn with_resolution(mut self, resolution: impl Into<String>) -> Self {
-        self.resolution = Some(resolution.into());
-        self
-    }
-
-    pub fn with_aspect_ratio(mut self, aspect_ratio: impl Into<String>) -> Self {
-        self.aspect_ratio = Some(aspect_ratio.into());
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageGenerationResponse {
-    #[serde(default)]
-    pub data: Vec<GeneratedImage>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GeneratedImage {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub b64_json: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media_type: Option<String>,
-}
-
-// ============================================================================
-// 响应类型
+// 响应
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChoiceImgUrl {
+pub struct WireChoiceImgUrl {
     pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChoiceImg {
+pub struct WireChoiceImg {
     #[serde(rename = "type")]
     pub img_type: String,
-    pub image_url: ChoiceImgUrl,
+    pub image_url: WireChoiceImgUrl,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChoiceAudio {
+pub struct WireChoiceAudio {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -405,15 +296,15 @@ pub struct ChoiceAudio {
 
 /// 选择项中的消息（非流式响应）
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChoiceMessage {
+pub struct WireChoiceMessage {
     pub role: MessageRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// DeepSeek 推理模式的推理内容（如 deepseek-reasoner）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// DeepSeek 和 OpenRouter 的推理内容。
+    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub images: Option<Vec<ChoiceImg>>,
+    pub images: Option<Vec<WireChoiceImg>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -422,54 +313,54 @@ pub struct ChoiceMessage {
 
 /// 非流式响应的选择项
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Choice {
+pub struct WireChoice {
     #[serde(deserialize_with = "deserialize_u32_lossy")]
     pub index: u32,
-    pub message: ChoiceMessage,
+    pub message: WireChoiceMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
 }
 
 /// 非流式完整响应
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Response {
+pub struct WireResponse {
     pub id: String,
     pub object: String,
     pub created: u64,
     pub model: String,
-    pub choices: Vec<Choice>,
+    pub choices: Vec<WireChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
+    pub usage: Option<WireUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
 }
 
 // ============================================================================
-// 流式响应类型
+// 流式响应
 // ============================================================================
 
 /// 流式响应中的 delta 内容
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct Delta {
+pub struct WireDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<MessageRole>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// DeepSeek 推理模式的推理内容（如 deepseek-reasoner）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// DeepSeek 和 OpenRouter 的推理内容。
+    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub audio: Option<ChoiceAudio>,
+    pub audio: Option<WireChoiceAudio>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// 流式响应的选择项
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct StreamChoice {
+pub struct WireStreamChoice {
     #[serde(deserialize_with = "deserialize_u32_lossy")]
     pub index: u32,
-    pub delta: Delta,
+    pub delta: WireDelta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -478,22 +369,36 @@ pub struct StreamChoice {
 
 /// 流式响应块
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct StreamResponse {
+pub struct WireStreamResponse {
     pub id: String,
     pub object: String,
     pub created: u64,
     pub model: String,
     pub system_fingerprint: Option<String>,
-    pub choices: Vec<StreamChoice>,
+    pub choices: Vec<WireStreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
+    pub usage: Option<WireUsage>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, Response, StreamResponse};
+    use super::*;
     use crate::Message;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_accepts_openrouter_and_deepseek_responses() {
+        for field in ["reasoning", "reasoning_content"] {
+            let mut message = json!({ "role": "assistant", "content": "answer" });
+            message[field] = json!("reasoning text");
+            let full: WireChoiceMessage = serde_json::from_value(message.clone()).unwrap();
+            let delta: WireDelta = serde_json::from_value(message).unwrap();
+            assert_eq!(full.reasoning_content.as_deref(), Some("reasoning text"));
+            assert_eq!(delta.reasoning_content.as_deref(), Some("reasoning text"));
+        }
+        let delta: WireDelta = serde_json::from_value(json!({"reasoning": null})).unwrap();
+        assert!(delta.reasoning_content.is_none());
+    }
 
     #[test]
     fn test_response_allows_null_content_for_images() {
@@ -522,7 +427,7 @@ mod tests {
             ]
         }"#;
 
-        let response: Response = serde_json::from_str(body).unwrap();
+        let response: WireResponse = serde_json::from_str(body).unwrap();
         let choice = response.choices.into_iter().next().unwrap();
 
         assert_eq!(choice.message.content, None);
@@ -566,7 +471,7 @@ mod tests {
             }
         }"#;
 
-        let response: Response = serde_json::from_str(body).unwrap();
+        let response: WireResponse = serde_json::from_str(body).unwrap();
         let choice = response.choices.into_iter().next().unwrap();
         let usage = response.usage.unwrap();
 
@@ -600,7 +505,7 @@ mod tests {
             ]
         }"#;
 
-        let response: StreamResponse = serde_json::from_str(body).unwrap();
+        let response: WireStreamResponse = serde_json::from_str(body).unwrap();
         let audio = response.choices[0].delta.audio.as_ref().unwrap();
 
         assert_eq!(audio.data.as_deref(), Some("YWJj"));
@@ -608,15 +513,33 @@ mod tests {
     }
 
     #[test]
-    fn test_request_supports_reasoning_effort_and_thinking() {
-        let request = Request::new("deepseek-v4-pro", vec![Message::user("hello")])
+    fn chat_request_maps_domain_fields_to_wire_body() {
+        let request = ChatRequest::new("deepseek-v4-pro", vec![Message::user("hello")])
+            .with_temperature(0.25)
+            .with_max_tokens(128)
+            .with_response_format_json()
             .with_reasoning_effort("high")
-            .with_thinking(true);
+            .with_thinking(true)
+            .with_stream_usage(true)
+            .with_tools(Some(vec![crate::agent::ToolDef {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: json!({ "type": "object" }),
+            }]));
 
-        assert_eq!(request.extra.get("reasoning_effort"), Some(&json!("high")));
-        assert_eq!(
-            request.extra.get("thinking"),
-            Some(&json!({ "type": "enabled" }))
-        );
+        let wire = serde_json::to_value(WireChatRequest::from(&request)).unwrap();
+
+        assert_eq!(wire["model"], "deepseek-v4-pro");
+        assert_eq!(wire["temperature"], 0.25);
+        assert_eq!(wire["max_tokens"], 128);
+        assert_eq!(wire["response_format"]["type"], "json_object");
+        assert_eq!(wire["reasoning_effort"], "high");
+        assert_eq!(wire["thinking"]["type"], "enabled");
+        assert_eq!(wire["stream_options"]["include_usage"], true);
+        assert_eq!(wire["tools"][0]["type"], "function");
+        assert_eq!(wire["tools"][0]["function"]["name"], "read_file");
+        assert!(wire.get("stream").is_none());
+        assert!(wire.get("modalities").is_none());
     }
+
 }

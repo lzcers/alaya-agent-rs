@@ -10,10 +10,7 @@ use crate::agent::compress::{
 use crate::agent::{
     Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall, ToolCallFunction,
 };
-use crate::{
-    providers::Request,
-    router::{ChatCapability, ChatChunk, RouterError},
-};
+use crate::capability::{ChatCapability, ChatChunk, ChatRequest, ModelError};
 use futures::stream::{self, BoxStream};
 
 fn conversation_with_tools_and_reasoning() -> Vec<Message> {
@@ -103,7 +100,7 @@ struct StubSummaryModel;
 
 #[async_trait]
 impl SummaryModel for StubSummaryModel {
-    async fn summarize(&self, prompt: &str) -> Result<String, RouterError> {
+    async fn summarize(&self, prompt: &str) -> Result<String, ModelError> {
         assert!(prompt.contains("Open the config"));
         assert!(prompt.contains("assistant_tool_call: read_file"));
         Ok("Decided to inspect config first.\nNeed to revisit handlers.".to_string())
@@ -116,7 +113,7 @@ struct StubChatModel {
 
 #[async_trait]
 impl ChatCapability for StubChatModel {
-    async fn chat(&self, request: Request) -> Result<Message, RouterError> {
+    async fn chat(&self, request: ChatRequest) -> Result<Message, ModelError> {
         assert_eq!(request.messages.len(), 2);
         assert!(matches!(request.messages[0], Message::System { .. }));
         assert!(matches!(request.messages[1], Message::User { .. }));
@@ -125,8 +122,8 @@ impl ChatCapability for StubChatModel {
 
     async fn chat_stream(
         &self,
-        _request: Request,
-    ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, ChatChunk>, ModelError> {
         Ok(Box::pin(stream::empty()))
     }
 }
@@ -339,7 +336,7 @@ async fn chat_summary_model_adapts_chat_capability() {
     let model = StubChatModel {
         response: Message::assistant("summary from chat model"),
     };
-    let adapter = ChatSummaryModel::new(&model, Request::new("summary-model", Vec::new()));
+    let adapter = ChatSummaryModel::new(&model, ChatRequest::new("summary-model", Vec::new()));
 
     let summary = adapter
         .summarize("Summarize this conversation.")

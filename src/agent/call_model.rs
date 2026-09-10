@@ -1,7 +1,6 @@
 use crate::Usage;
 use crate::agent::{ToolCall, ToolExecutor};
-use crate::providers::Request;
-use crate::router::{ChatCapability, format_router_error};
+use crate::capability::{ChatCapability, ChatRequest, format_model_error};
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -49,7 +48,7 @@ pub enum CallModelEvent {
 // 调用一个具备 chat 能力的模型，至少要实现 chat_stream 方法
 pub fn call_model(
     model: &(dyn ChatCapability + Sync),
-    request: Request,
+    request: ChatRequest,
 ) -> impl Stream<Item = CallModelEvent> {
     let mut final_content = String::new();
     let mut final_reasoning_content = String::new();
@@ -61,7 +60,7 @@ pub fn call_model(
         let mut response_stream = match model.chat_stream(request).await {
             Ok(s) => s,
             Err(e) => {
-                yield CallModelEvent::Error(format_router_error(&e));
+                yield CallModelEvent::Error(format_model_error(&e));
                 return;
             }
         };
@@ -211,7 +210,7 @@ mod tests {
     use super::*;
     use crate::{
         Message,
-        router::{ChatChunk, RouterError},
+        capability::{ChatChunk, ModelError},
     };
     use async_trait::async_trait;
     use futures::{StreamExt, stream, stream::BoxStream};
@@ -222,14 +221,14 @@ mod tests {
 
     #[async_trait]
     impl ChatCapability for MockChatModel {
-        async fn chat(&self, _request: Request) -> Result<Message, RouterError> {
+        async fn chat(&self, _request: ChatRequest) -> Result<Message, ModelError> {
             panic!("chat should not be called in this test");
         }
 
         async fn chat_stream(
             &self,
-            _request: Request,
-        ) -> Result<BoxStream<'static, ChatChunk>, RouterError> {
+            _request: ChatRequest,
+        ) -> Result<BoxStream<'static, ChatChunk>, ModelError> {
             Ok(Box::pin(stream::iter(self.chunks.clone())))
         }
     }
@@ -267,7 +266,7 @@ mod tests {
 
         let events = call_model(
             &model,
-            Request::new("mock-model", vec![Message::user("hi")]).with_stream(true),
+            ChatRequest::new("mock-model", vec![Message::user("hi")]),
         )
         .collect::<Vec<_>>()
         .await;
