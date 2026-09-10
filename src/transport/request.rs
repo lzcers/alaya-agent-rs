@@ -121,12 +121,6 @@ impl HttpResponse {
         &self.headers
     }
 
-    pub fn content_type(&self) -> Option<&str> {
-        self.headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-    }
-
     /// 交出响应体流，不做任何解释。
     pub fn into_body(self) -> BodyStream {
         self.body

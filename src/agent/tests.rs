@@ -1,7 +1,7 @@
 use crate::agent::tools::playwright_cli::PlaywrightCliTool;
 use crate::agent::{
     AgentActor, AgentActorEvent, AgentTerminalReason, Context, GenericToolExecutor, StepResult,
-    Tool, ToolCall, ToolCallFunction, ToolDef, ToolExecutorError,
+    Tool, ToolCall, ToolDef, ToolExecutorError,
 };
 
 use crate::capability::{ChatCapability, ChatChunk, ChatRequest, ModelError};
@@ -10,7 +10,7 @@ use crate::router::ModelRouter;
 use crate::{Message, Usage};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -41,7 +41,7 @@ fn preview_text(text: &str, max_chars: usize) -> String {
 }
 
 fn print_tool_call(index: usize, call: &ToolCall) {
-    let name = call.get_name();
+    let name = call.name.clone();
     print_field(
         &format!("tool_{}_name", index),
         if name.is_empty() {
@@ -52,7 +52,7 @@ fn print_tool_call(index: usize, call: &ToolCall) {
     );
     print_field(
         &format!("tool_{}_args", index),
-        preview_text(&format_json_value(&call.get_arguments()), 220),
+        preview_text(&format_json_value(&call.arguments), 220),
     );
 }
 
@@ -207,7 +207,7 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
             AgentActorEvent::ToolCalls(calls) => {
                 print_section(&format!("Tool Calls ({})", calls.len()));
                 for (index, call) in calls.iter().enumerate() {
-                    tool_calls_log.push(call.get_name());
+                    tool_calls_log.push(call.name.clone());
                     print_tool_call(index + 1, call);
                 }
             }
@@ -322,7 +322,7 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
                     ..
                 } => tools_call
                     .iter()
-                    .map(|call| call.get_name())
+                    .map(|call| call.name.clone())
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             })
@@ -407,14 +407,8 @@ async fn test_agent_actor_emits_step_frame_metrics_to_upper_layer() {
             finish_reason: Some("tool_calls".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
-                call_type: Some("function".to_string()),
-                index: Some(0),
-                function: Some(ToolCallFunction {
-                    name: "echo".to_string(),
-                    arguments: r#"{"value":"ok"}"#.to_string(),
-                }),
-                name: None,
-                arguments: None,
+                name: "echo".to_string(),
+                arguments: json!({ "value": "ok" }),
             }]),
             usage: None,
         }],

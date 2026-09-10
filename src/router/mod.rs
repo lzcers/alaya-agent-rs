@@ -155,6 +155,19 @@ mod tests {
         }
     }
 
+    struct StubAudio;
+
+    #[async_trait]
+    impl GenAudioCapability for StubAudio {
+        async fn gen_audio(&self, _request: GenAudioRequest) -> Result<GenAudioResponse, ModelError> {
+            Ok(GenAudioResponse {
+                audio_data: "stub".to_string(),
+                transcript: String::new(),
+                format: "wav".to_string(),
+            })
+        }
+    }
+
     struct StubImage;
 
     #[async_trait]
@@ -222,6 +235,19 @@ mod tests {
         assert!(!router.supports_chat("black-forest-labs/flux.2-klein-4b"));
         assert!(router.supports_image("black-forest-labs/flux.2-klein-4b"));
         assert!(!router.supports_image("deepseek-chat"));
+    }
+
+    #[test]
+    fn every_capability_supports_bulk_registration() {
+        let mut router = ModelRouter::new();
+        router.add_chat_models(&["chat-a", "chat-b"], Arc::new(StubChat));
+        router.add_image_models(&["image-a", "image-b"], Arc::new(StubImage));
+        router.add_audio_models(&["audio-a"], Arc::new(StubAudio));
+
+        assert!(router.supports_chat("chat-b"));
+        assert!(router.supports_image("image-b"));
+        assert!(router.supports_audio("audio-a"));
+        assert!(!router.supports_audio("audio-b"));
     }
 
     #[test]

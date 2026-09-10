@@ -2,9 +2,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use crate::Usage;
-use crate::agent::{ToolCall, ToolDef};
 use crate::capability::ModelError;
-use crate::message::Message;
+use crate::message::{Message, ToolCall, ToolDef};
 
 /// 与厂商无关的推理强度配置。
 ///
@@ -99,6 +98,10 @@ pub struct ChatChunk {
     pub reasoning_content: String,
     pub is_finished: bool,
     pub finish_reason: Option<String>,
+    /// 到目前为止模型请求的**完整**工具调用列表（累积快照，**不是**增量）。
+    ///
+    /// 协议层负责把流式碎片（OpenAI 的 `index` + `function.arguments` 字符串拼接）
+    /// 合并成完整项，因此调用方取最后一个 `Some` 即可，不需要自己拼接。
     pub tool_calls: Option<Vec<ToolCall>>,
     pub usage: Option<Usage>,
 }

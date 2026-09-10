@@ -138,10 +138,7 @@ async fn memory_tools_register_and_execute_via_generic_executor() {
 fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
     ToolCall {
         id: id.to_string(),
-        call_type: None,
-        index: None,
-        function: None,
-        name: Some(name.to_string()),
-        arguments: Some(arguments),
+        name: name.to_string(),
+        arguments,
     }
 }

@@ -1,6 +1,5 @@
 pub mod agent;
 pub mod capability;
-pub mod conversation;
 pub mod endpoints;
 pub mod message;
 pub mod protocols;

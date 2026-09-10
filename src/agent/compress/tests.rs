@@ -8,7 +8,7 @@ use crate::agent::compress::{
     RuleCompression, SummaryModel,
 };
 use crate::agent::{
-    Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall, ToolCallFunction,
+    Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall,
 };
 use crate::capability::{ChatCapability, ChatChunk, ChatRequest, ModelError};
 use futures::stream::{self, BoxStream};
@@ -22,14 +22,8 @@ fn conversation_with_tools_and_reasoning() -> Vec<Message> {
             reasoning_content: Some("Need to inspect the config first".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
-                call_type: Some("function".to_string()),
-                index: None,
-                function: Some(ToolCallFunction {
-                    name: "read_file".to_string(),
-                    arguments: "{\"path\":\"config.json\"}".to_string(),
-                }),
-                name: None,
-                arguments: None,
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "config.json" }),
             }]),
         },
         Message::Tool {
@@ -47,14 +41,8 @@ fn conversation_with_tools_and_reasoning() -> Vec<Message> {
             reasoning_content: Some("Need grep across the repository".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_2".to_string(),
-                call_type: Some("function".to_string()),
-                index: None,
-                function: Some(ToolCallFunction {
-                    name: "file_search".to_string(),
-                    arguments: "{\"pattern\":\"handler\"}".to_string(),
-                }),
-                name: None,
-                arguments: None,
+                name: "file_search".to_string(),
+                arguments: json!({ "pattern": "handler" }),
             }]),
         },
         Message::Tool {

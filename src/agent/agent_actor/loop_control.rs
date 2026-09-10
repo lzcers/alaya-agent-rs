@@ -273,7 +273,7 @@ where
         match result {
             StepResult::Continue { tools_call, .. } => {
                 // 检查是否有 AskUser 工具调用
-                if tools_call.iter().any(|tool| tool.get_name() == "ask_user") {
+                if tools_call.iter().any(|tool| tool.name == "ask_user") {
                     // 如果有 AskUser 工具调用，检查是否已经设置了 pending_user_input
                     if self.has_pending_user_input() {
                         // 从 pending_user_input 中获取 input_id

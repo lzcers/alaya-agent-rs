@@ -20,9 +20,12 @@ use crate::capability::{
     ChatCapability, ChatChunk, ChatRequest, GenAudioCapability, GenAudioRequest, GenAudioResponse,
     ModelError,
 };
+use crate::message::ToolCall;
 use crate::providers::Provider;
 
-use wire::{WireAudioConfig, WireChatRequest, WireResponse, WireStreamResponse};
+use wire::{
+    WireAudioConfig, WireChatRequest, WireResponse, WireStreamResponse, WireToolCall,
+};
 
 const CHAT_PATH: &str = "/chat/completions";
 
@@ -97,7 +100,9 @@ fn message_from_wire(message: wire::WireChoiceMessage) -> Message {
         MessageRole::Assistant => Message::Assistant {
             content: message.content.unwrap_or_default(),
             reasoning_content: message.reasoning_content,
-            tool_calls: message.tool_calls,
+            tool_calls: message
+                .tool_calls
+                .map(|calls| calls.into_iter().map(WireToolCall::into_domain).collect()),
         },
         MessageRole::User => Message::User {
             content: message.content.unwrap_or_default(),
@@ -112,23 +117,62 @@ fn message_from_wire(message: wire::WireChoiceMessage) -> Message {
     }
 }
 
-fn chunk_from_wire(response: WireStreamResponse) -> ChatChunk {
+/// 把一条增量并进累积状态。
+///
+/// OpenAI 的流式 tool call 是按 `index` 分片送达的：首个 chunk 给出 `id` 和函数名，
+/// 后续 chunk 只带参数文本片段。这是纯 wire 层的产物（Anthropic 用的是
+/// `input_json_delta`），所以归并逻辑留在这里，不往上泄漏。
+fn accumulate_tool_calls(accumulated: &mut Vec<WireToolCall>, deltas: &[WireToolCall]) {
+    for delta in deltas {
+        match accumulated
+            .iter_mut()
+            .find(|existing| existing.same_call(delta))
+        {
+            Some(existing) => existing.merge_from(delta),
+            None => accumulated.push(delta.clone()),
+        }
+    }
+}
+
+/// 累积状态 → 域快照。空列表表示这个响应没有任何工具调用。
+fn accumulated_tool_calls(accumulated: &[WireToolCall]) -> Option<Vec<ToolCall>> {
+    if accumulated.is_empty() {
+        return None;
+    }
+    Some(
+        accumulated
+            .iter()
+            .cloned()
+            .map(WireToolCall::into_domain)
+            .collect(),
+    )
+}
+
+fn chunk_from_wire(response: WireStreamResponse, accumulated: &mut Vec<WireToolCall>) -> ChatChunk {
+    let usage = response.usage.map(Into::into);
+
     match response.choices.first() {
-        Some(choice) => ChatChunk {
-            content: choice.delta.content.clone().unwrap_or_default(),
-            reasoning_content: choice.delta.reasoning_content.clone().unwrap_or_default(),
-            is_finished: choice.finish_reason.is_some(),
-            finish_reason: choice.finish_reason.clone(),
-            tool_calls: choice.delta.tool_calls.clone(),
-            usage: response.usage.map(Into::into),
-        },
+        Some(choice) => {
+            if let Some(deltas) = &choice.delta.tool_calls {
+                accumulate_tool_calls(accumulated, deltas);
+            }
+
+            ChatChunk {
+                content: choice.delta.content.clone().unwrap_or_default(),
+                reasoning_content: choice.delta.reasoning_content.clone().unwrap_or_default(),
+                is_finished: choice.finish_reason.is_some(),
+                finish_reason: choice.finish_reason.clone(),
+                tool_calls: accumulated_tool_calls(accumulated),
+                usage,
+            }
+        }
         None => ChatChunk {
             content: String::new(),
             reasoning_content: String::new(),
             is_finished: true,
             finish_reason: Some("no_choices".to_string()),
-            tool_calls: None,
-            usage: response.usage.map(Into::into),
+            tool_calls: accumulated_tool_calls(accumulated),
+            usage,
         },
     }
 }
@@ -154,7 +198,12 @@ impl ChatCapability for OpenAiCompatible {
         let wire = WireChatRequest::from(&request);
         let stream = self.chat_completions_stream(&wire).await?;
 
-        Ok(stream.map(chunk_from_wire).boxed())
+        // 累积状态归协议层所有：上层拿到的是完整调用，不是需要自己拼的碎片。
+        Ok(stream
+            .scan(Vec::<WireToolCall>::new(), |accumulated, response| {
+                futures::future::ready(Some(chunk_from_wire(response, accumulated)))
+            })
+            .boxed())
     }
 }
 
@@ -299,7 +348,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{FakeTransport, fake_provider};
     use super::*;
-    use crate::agent::ToolDef;
+    use crate::message::{ToolCall, ToolDef};
     use serde_json::{Value, json};
 
     fn chat_wire_response(content: &str) -> Value {
@@ -422,6 +471,93 @@ mod tests {
         assert_eq!(body["modalities"], json!(["text", "audio"]));
         assert_eq!(body["audio"], json!({ "format": "wav" }));
         assert_eq!(body["messages"][0]["content"], "Generate a short piano loop");
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_call_fragments_become_one_complete_domain_call() {
+        let chunk = |delta: Value, finish: Value| {
+            json!({
+                "id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+                "system_fingerprint": null,
+                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }]
+            })
+            .to_string()
+        };
+        let transport = FakeTransport::with_raw_events(vec![
+            chunk(
+                json!({ "tool_calls": [{ "index": 0, "id": "call_1", "type": "function",
+                        "function": { "name": "read_file", "arguments": "" } }] }),
+                Value::Null,
+            ),
+            chunk(
+                json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "{\"path\":" } }] }),
+                Value::Null,
+            ),
+            chunk(
+                json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "\"a.txt\"}" } }] }),
+                Value::Null,
+            ),
+            chunk(json!({}), json!("tool_calls")),
+        ]);
+        let model = OpenAiCompatible::new(fake_provider(transport));
+
+        let chunks = model
+            .chat_stream(ChatRequest::new("m", vec![Message::user("hi")]))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        // 上层拿到的是累积快照，最后一帧是完整调用——不需要自己拼接。
+        let last = chunks.last().unwrap();
+        assert!(last.is_finished);
+        assert_eq!(
+            last.tool_calls,
+            Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "a.txt" }),
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_tool_calls_round_trip_back_into_wire_messages() {
+        let transport = FakeTransport::with_json(chat_wire_response("ok"));
+        let model = OpenAiCompatible::new(fake_provider(transport.clone()));
+
+        let messages = vec![
+            Message::user("hi"),
+            Message::Assistant {
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "a.txt" }),
+                }]),
+            },
+            Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "{}".to_string(),
+            },
+        ];
+
+        model
+            .chat(ChatRequest::new("m", messages))
+            .await
+            .unwrap();
+
+        // 域形状 {id, name, arguments} → wire 嵌套 {type, function:{name, arguments 文本}}
+        let body = transport.first_body();
+        let call = &body["messages"][1]["tool_calls"][0];
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "read_file");
+        assert_eq!(call["function"]["arguments"], "{\"path\":\"a.txt\"}");
+        assert!(call.get("name").is_none(), "不应泄漏域侧平铺字段");
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
     }
 
     #[tokio::test]

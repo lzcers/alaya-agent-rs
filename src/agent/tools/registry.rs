@@ -75,13 +75,13 @@ impl Default for GenericToolExecutor {
 #[async_trait]
 impl ToolExecutor for GenericToolExecutor {
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolExecutorError> {
-        let name = call.get_name();
+        let name = call.name.clone();
         let tool = self
             .registry
             .get(&name)
             .ok_or_else(|| ToolExecutorError::ToolNotFound(name.clone()))?;
 
-        let arguments = call.get_arguments();
+        let arguments = call.arguments.clone();
         let output = tool.execute(arguments).await?;
 
         Ok(ToolResult {

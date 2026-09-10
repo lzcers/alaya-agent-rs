@@ -1,6 +1,13 @@
+//! 消息域：模型看到的消息与工具词汇。
+//!
+//! `Message` 既是域类型也是 OpenAI 兼容的 wire messages 形状——它不携带任何
+//! 协议独有字段，因此不需要在协议层再镜像一份。
+
+pub mod tool;
+
 use serde::{Deserialize, Serialize};
 
-use crate::agent::ToolCall;
+pub use tool::{ToolCall, ToolDef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,18 +58,6 @@ impl Message {
         Self::Assistant {
             content: content.into(),
             reasoning_content: None,
-            tool_calls: None,
-        }
-    }
-
-    /// 创建带推理内容的 Assistant 消息
-    pub fn assistant_with_reasoning(
-        content: impl Into<String>,
-        reasoning_content: impl Into<String>,
-    ) -> Self {
-        Self::Assistant {
-            content: content.into(),
-            reasoning_content: Some(reasoning_content.into()),
             tool_calls: None,
         }
     }

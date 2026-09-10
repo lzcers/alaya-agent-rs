@@ -34,6 +34,6 @@ pub use select::{
 };
 
 pub use tools::{
-    GenericToolExecutor, Tool, ToolCall, ToolCallFunction, ToolDef, ToolExecutor,
-    ToolExecutorError, ToolRegistry, ToolResult,
+    GenericToolExecutor, Tool, ToolCall, ToolDef, ToolExecutor, ToolExecutorError, ToolRegistry,
+    ToolResult,
 };

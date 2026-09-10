@@ -80,8 +80,9 @@ pub fn call_model(
                     yield CallModelEvent::ReasoningChunk(reasoning_content);
                 }
 
-                if let Some(inc_tool_calls) = tool_calls {
-                    merge_tool_calls(&mut final_tool_calls, inc_tool_calls);
+                // 协议层已经交付累积快照，这里直接替换。
+                if let Some(snapshot) = tool_calls {
+                    final_tool_calls = snapshot;
                 }
 
                 if let Some(usage) = usage {
@@ -112,7 +113,7 @@ pub fn call_model(
 
 pub async fn call_tool(tool_executor: &dyn ToolExecutor, call: &ToolCall) -> CallToolResult {
     let call_id = call.id.clone();
-    let tool_name = call.get_name();
+    let tool_name = call.name.clone();
 
     let result = tool_executor.execute(call).await;
 
@@ -158,49 +159,6 @@ pub fn call_tools(
         let results = futures::future::join_all(futures).await;
         for result in results {
             yield result;
-        }
-    }
-}
-
-/// 合并增量 ToolCall
-/// 流式响应中 tool_calls 是增量发送的，需要按 index 合并
-fn merge_tool_calls(accumulated: &mut Vec<ToolCall>, incremental: Vec<ToolCall>) {
-    for inc in incremental {
-        // 查找是否已存在相同 index 或 id 的 tool call
-        let existing = accumulated.iter_mut().find(|tc| {
-            // 优先按 index 匹配，其次按 id 匹配
-            if let (Some(idx1), Some(idx2)) = (tc.index, inc.index) {
-                idx1 == idx2
-            } else {
-                !tc.id.is_empty() && tc.id == inc.id
-            }
-        });
-
-        if let Some(existing) = existing {
-            // 合并增量数据
-            if !inc.id.is_empty() {
-                existing.id = inc.id;
-            }
-            if inc.call_type.is_some() {
-                existing.call_type = inc.call_type;
-            }
-            if inc.index.is_some() {
-                existing.index = inc.index;
-            }
-            // 合并 function 字段
-            if let Some(inc_func) = &inc.function {
-                if let Some(existing_func) = &mut existing.function {
-                    if !inc_func.name.is_empty() {
-                        existing_func.name = inc_func.name.clone();
-                    }
-                    existing_func.arguments.push_str(&inc_func.arguments);
-                } else {
-                    existing.function = Some(inc_func.clone());
-                }
-            }
-        } else {
-            // 新增 tool call
-            accumulated.push(inc);
         }
     }
 }

@@ -6,11 +6,11 @@
 use serde::de::{self, Unexpected};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 use crate::MessageRole;
-use crate::agent::ToolCall;
 use crate::capability::ChatRequest;
-use crate::message::Message;
+use crate::message::{Message, ToolCall};
 
 // ============================================================================
 // 容错反序列化
@@ -90,7 +90,7 @@ where
 #[derive(Debug, Clone, Serialize)]
 pub struct WireChatRequest {
     pub model: String,
-    pub messages: Vec<Message>,
+    pub messages: Vec<WireMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,6 +111,208 @@ pub struct WireChatRequest {
     pub modalities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<WireAudioConfig>,
+}
+
+/// 请求体里的消息。
+///
+/// 与域 [`Message`] 的唯一差别是 `tool_calls` 用 wire 形状——域侧的
+/// [`ToolCall`] 只有 `{id, name, arguments}`，需要在边界上翻译。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "role")]
+pub enum WireMessage {
+    #[serde(rename = "system")]
+    System { content: String },
+    #[serde(rename = "user")]
+    User { content: String },
+    #[serde(rename = "assistant")]
+    Assistant {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_calls: Option<Vec<WireToolCall>>,
+    },
+    #[serde(rename = "tool")]
+    Tool { tool_call_id: String, content: String },
+}
+
+impl From<&Message> for WireMessage {
+    fn from(message: &Message) -> Self {
+        match message {
+            Message::System { content } => Self::System {
+                content: content.clone(),
+            },
+            Message::User { content } => Self::User {
+                content: content.clone(),
+            },
+            Message::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+            } => Self::Assistant {
+                content: content.clone(),
+                reasoning_content: reasoning_content.clone(),
+                tool_calls: tool_calls
+                    .as_ref()
+                    .map(|calls| calls.iter().map(WireToolCall::from).collect()),
+            },
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => Self::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: content.clone(),
+            },
+        }
+    }
+}
+
+impl From<WireMessage> for Message {
+    fn from(message: WireMessage) -> Self {
+        match message {
+            WireMessage::System { content } => Self::System { content },
+            WireMessage::User { content } => Self::User { content },
+            WireMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+            } => Self::Assistant {
+                content,
+                reasoning_content,
+                tool_calls: tool_calls.map(|calls| {
+                    calls
+                        .into_iter()
+                        .map(WireToolCall::into_domain)
+                        .collect()
+                }),
+            },
+            WireMessage::Tool {
+                tool_call_id,
+                content,
+            } => Self::Tool {
+                tool_call_id,
+                content,
+            },
+        }
+    }
+}
+
+/// OpenAI 的 tool_calls 元素。
+///
+/// 流式增量里字段可能只到一部分（后续 chunk 只带 `index` 和参数片段），
+/// 所以除 `id` 外全是 Option；`merge_into` 负责把这些碎片拼成完整项。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireToolCall {
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    /// 流式增量中的序号，用于把同一条调用的碎片归并到一起。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    /// OpenAI 嵌套格式：`{"name": ..., "arguments": "<JSON 文本>"}`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<WireToolCallFunction>,
+    /// 平铺格式，部分网关直接给 `name` / `arguments`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireToolCallFunction {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub arguments: String,
+}
+
+impl WireToolCall {
+    /// 把一条增量并进本条：同一条调用的字段可能分散在多个 chunk 里。
+    pub fn merge_from(&mut self, delta: &WireToolCall) {
+        if !delta.id.is_empty() {
+            self.id = delta.id.clone();
+        }
+        if delta.call_type.is_some() {
+            self.call_type = delta.call_type.clone();
+        }
+        if delta.index.is_some() {
+            self.index = delta.index;
+        }
+        if let Some(delta_function) = &delta.function {
+            match &mut self.function {
+                Some(existing) => {
+                    if !delta_function.name.is_empty() {
+                        existing.name = delta_function.name.clone();
+                    }
+                    existing.arguments.push_str(&delta_function.arguments);
+                }
+                None => self.function = Some(delta_function.clone()),
+            }
+        }
+        if let Some(delta_name) = &delta.name
+            && !delta_name.is_empty()
+        {
+            self.name = Some(delta_name.clone());
+        }
+        if delta.arguments.is_some() {
+            self.arguments = delta.arguments.clone();
+        }
+    }
+
+    /// 两条增量是否指向同一条调用：优先按 `index`，否则按非空 `id`。
+    pub fn same_call(&self, other: &WireToolCall) -> bool {
+        match (self.index, other.index) {
+            (Some(left), Some(right)) => left == right,
+            _ => !self.id.is_empty() && self.id == other.id,
+        }
+    }
+
+    /// wire → 域。
+    ///
+    /// 参数在 wire 上是 JSON 文本，解析失败时记录告警并落 [`Value::Null`]——
+    /// 与静默兜底相比，至少让畸形参数可见。
+    pub fn into_domain(self) -> ToolCall {
+        let (name, raw_arguments) = match &self.function {
+            Some(function) => (function.name.clone(), Some(function.arguments.as_str())),
+            None => (self.name.clone().unwrap_or_default(), None),
+        };
+
+        let arguments = match (raw_arguments, &self.arguments) {
+            (Some(raw), _) if !raw.trim().is_empty() => match serde_json::from_str(raw) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    warn!(%error, raw, "tool call arguments are not valid JSON");
+                    Value::Null
+                }
+            },
+            (_, Some(parsed)) => parsed.clone(),
+            _ => Value::Null,
+        };
+
+        ToolCall {
+            id: self.id,
+            name,
+            arguments,
+        }
+    }
+}
+
+impl From<&ToolCall> for WireToolCall {
+    fn from(call: &ToolCall) -> Self {
+        Self {
+            id: call.id.clone(),
+            call_type: Some("function".to_string()),
+            index: None,
+            function: Some(WireToolCallFunction {
+                name: call.name.clone(),
+                arguments: call.arguments.to_string(),
+            }),
+            name: None,
+            arguments: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,10 +354,10 @@ pub struct WireAudioConfig {
 }
 
 impl WireChatRequest {
-    fn base(model: impl Into<String>, messages: Vec<Message>) -> Self {
+    fn base(model: impl Into<String>, messages: &[Message]) -> Self {
         Self {
             model: model.into(),
-            messages,
+            messages: messages.iter().map(WireMessage::from).collect(),
             stream: None,
             temperature: None,
             max_tokens: None,
@@ -173,7 +375,7 @@ impl WireChatRequest {
 /// 域请求 → wire body。所有厂商私有字段的编码都发生在这里。
 impl From<&ChatRequest> for WireChatRequest {
     fn from(request: &ChatRequest) -> Self {
-        let mut wire = Self::base(request.model.clone(), request.messages.clone());
+        let mut wire = Self::base(request.model.clone(), &request.messages);
 
         wire.temperature = request.temperature;
         wire.max_tokens = request.max_tokens;
@@ -306,7 +508,7 @@ pub struct WireChoiceMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<WireChoiceImg>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Option<Vec<WireToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
@@ -352,7 +554,7 @@ pub struct WireDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<WireChoiceAudio>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Option<Vec<WireToolCall>>,
 }
 
 /// 流式响应的选择项
@@ -385,6 +587,102 @@ mod tests {
     use super::*;
     use crate::Message;
     use serde_json::json;
+
+    #[test]
+    fn tool_call_fragments_merge_by_index() {
+        let mut accumulated = WireToolCall {
+            id: "call_1".to_string(),
+            call_type: Some("function".to_string()),
+            index: Some(0),
+            function: Some(WireToolCallFunction {
+                name: "read_file".to_string(),
+                arguments: String::new(),
+            }),
+            ..Default::default()
+        };
+
+        // 后续 chunk 只带 index 和参数片段。
+        let fragment_a = WireToolCall {
+            index: Some(0),
+            function: Some(WireToolCallFunction {
+                name: String::new(),
+                arguments: "{\"path\":".to_string(),
+            }),
+            ..Default::default()
+        };
+        let fragment_b = WireToolCall {
+            index: Some(0),
+            function: Some(WireToolCallFunction {
+                name: String::new(),
+                arguments: "\"a.txt\"}".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        assert!(accumulated.same_call(&fragment_a));
+        accumulated.merge_from(&fragment_a);
+        accumulated.merge_from(&fragment_b);
+
+        assert_eq!(
+            accumulated.function.unwrap().arguments,
+            "{\"path\":\"a.txt\"}"
+        );
+    }
+
+    #[test]
+    fn wire_tool_call_maps_to_domain_with_parsed_arguments() {
+        let call = WireToolCall {
+            id: "call_1".to_string(),
+            call_type: Some("function".to_string()),
+            index: Some(0),
+            function: Some(WireToolCallFunction {
+                name: "read_file".to_string(),
+                arguments: "{\"path\":\"a.txt\"}".to_string(),
+            }),
+            name: None,
+            arguments: None,
+        };
+
+        assert_eq!(
+            call.into_domain(),
+            ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "a.txt" }),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_tool_arguments_fall_back_to_null() {
+        let call = WireToolCall {
+            id: "call_1".to_string(),
+            function: Some(WireToolCallFunction {
+                name: "read_file".to_string(),
+                arguments: "{\"path\":".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(call.into_domain().arguments, Value::Null);
+    }
+
+    #[test]
+    fn domain_tool_call_encodes_back_to_nested_wire_shape() {
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "a.txt" }),
+        };
+
+        let wire = serde_json::to_value(WireToolCall::from(&call)).unwrap();
+
+        assert_eq!(wire["id"], "call_1");
+        assert_eq!(wire["type"], "function");
+        assert_eq!(wire["function"]["name"], "read_file");
+        assert_eq!(wire["function"]["arguments"], "{\"path\":\"a.txt\"}");
+        assert!(wire.get("index").is_none());
+    }
 
     #[test]
     fn reasoning_accepts_openrouter_and_deepseek_responses() {
@@ -521,7 +819,7 @@ mod tests {
             .with_reasoning_effort("high")
             .with_thinking(true)
             .with_stream_usage(true)
-            .with_tools(Some(vec![crate::agent::ToolDef {
+            .with_tools(Some(vec![crate::message::ToolDef {
                 name: "read_file".to_string(),
                 description: "read".to_string(),
                 parameters: json!({ "type": "object" }),

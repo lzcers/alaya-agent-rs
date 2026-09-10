@@ -120,15 +120,11 @@ fn transcript_lines(message: &Message) -> Vec<String> {
             }
             if let Some(tool_calls) = tool_calls {
                 for call in tool_calls {
-                    let name = call.get_name();
+                    let name = call.name.clone();
                     if name.is_empty() {
                         continue;
                     }
-                    lines.push(format!(
-                        "assistant_tool_call: {} {}",
-                        name,
-                        call.get_arguments()
-                    ));
+                    lines.push(format!("assistant_tool_call: {} {}", name, call.arguments));
                 }
             }
             lines
