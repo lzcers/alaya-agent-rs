@@ -3,6 +3,10 @@
 //! 只负责 HTTP 规范里的「事件切分」：把字节流切成一个个事件的 `data` 载荷。
 //! 载荷本身是什么（JSON、`[DONE]`、别的文本）由协议层决定，传输层不解释。
 
+use futures::StreamExt;
+
+use super::{BodyStream, TransportError};
+
 /// 把 CRLF 归一化为 LF，避免逐字节切分时把 `\r\n\r\n` 误判。
 fn normalize_crlf(buffer: &mut Vec<u8>) {
     let mut read = 0;
@@ -47,9 +51,40 @@ pub(crate) fn drain_events(buffer: &mut Vec<u8>) -> Vec<String> {
     events
 }
 
+/// 把响应体字节流切成 SSE 事件的 `data` 载荷流。
+///
+/// 中途的读取失败以 `Err` 形式出现在流里并终止流。
+pub fn data_events(mut body: BodyStream) -> impl futures::Stream<Item = Result<String, TransportError>> {
+    async_stream::stream! {
+        let mut buffer = Vec::new();
+
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    buffer.extend_from_slice(&bytes);
+                    for event in drain_events(&mut buffer) {
+                        yield Ok(event);
+                    }
+                }
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+
+        // 有些服务端最后一条事件不带结尾空行，补一个终止符把残留冲刷出来。
+        buffer.extend_from_slice(b"\n\n");
+        for event in drain_events(&mut buffer) {
+            yield Ok(event);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use serde_json::json;
 
     #[test]
@@ -61,7 +96,10 @@ mod tests {
         buffer.extend_from_slice(b",\"object\":\"chat.completion.chunk\"}\n\n");
         let events = drain_events(&mut buffer);
 
-        assert_eq!(events, vec!["{\"id\":\"abc\",\"object\":\"chat.completion.chunk\"}"]);
+        assert_eq!(
+            events,
+            vec!["{\"id\":\"abc\",\"object\":\"chat.completion.chunk\"}"]
+        );
         assert!(buffer.is_empty());
     }
 
@@ -98,5 +136,38 @@ mod tests {
         let mut buffer = b"\n\ndata: {\"a\":1}\n\n".to_vec();
 
         assert_eq!(drain_events(&mut buffer), vec!["{\"a\":1}"]);
+    }
+
+    #[tokio::test]
+    async fn data_events_frames_a_chunked_body() {
+        let body: BodyStream = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: {\"i\":1}\n\ndata: {\"i\":")),
+            Ok(Bytes::from_static(b"2}\n\ndata: [DONE]\n\n")),
+        ]));
+
+        let events = data_events(body)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(events, vec!["{\"i\":1}", "{\"i\":2}", "[DONE]"]);
+    }
+
+    #[tokio::test]
+    async fn data_events_flushes_trailing_event_without_blank_line() {
+        let body: BodyStream = Box::pin(futures::stream::once(async {
+            Ok(Bytes::from_static(b"data: {\"last\":true}"))
+        }));
+
+        let events = data_events(body)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(events, vec!["{\"last\":true}"]);
     }
 }

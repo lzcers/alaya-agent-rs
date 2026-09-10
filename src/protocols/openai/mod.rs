@@ -1,7 +1,8 @@
 //! OpenAI 兼容协议适配器（chat 与 chat 上的音频输出）。
 //!
 //! 这是唯一知道 `/chat/completions` 与相关 wire 结构体的地方，也是
-//! wire ↔ 域类型映射的落点。
+//! wire ↔ 域类型映射的落点。它持有一个 [`Provider`]（厂商身份），
+//! 地址与认证由对方负责，本层只管形状。
 //!
 //! 注意：OpenRouter 的**图片**端点不在这里——它用的是 OpenRouter 自有的
 //! `/images` 形状（`resolution` / `aspect_ratio`），属于
@@ -11,7 +12,6 @@ pub mod wire;
 
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
-use std::sync::Arc;
 use tracing::warn;
 
 use crate::Message;
@@ -20,7 +20,7 @@ use crate::capability::{
     ChatCapability, ChatChunk, ChatRequest, GenAudioCapability, GenAudioRequest, GenAudioResponse,
     ModelError,
 };
-use crate::providers::{Provider, ProviderError};
+use crate::providers::Provider;
 
 use wire::{WireAudioConfig, WireChatRequest, WireResponse, WireStreamResponse};
 
@@ -31,27 +31,24 @@ const CHAT_PATH: &str = "/chat/completions";
 /// 同一个实例可以承担 chat 与音频生成——能力是否真的可用是**端点**的属性，
 /// 由注册方断言。
 pub struct OpenAiCompatible {
-    http: Arc<dyn Provider>,
+    provider: Provider,
 }
 
 impl OpenAiCompatible {
-    pub fn new(http: Arc<dyn Provider>) -> Self {
-        Self { http }
+    pub fn new(provider: Provider) -> Self {
+        Self { provider }
     }
 
-    /// 底层传输，便于测试与自定义。
-    pub fn http(&self) -> &Arc<dyn Provider> {
-        &self.http
+    pub fn provider(&self) -> &Provider {
+        &self.provider
     }
 
     /// 非流式 chat completions。
     pub async fn chat_completions(
         &self,
         wire: &WireChatRequest,
-    ) -> Result<WireResponse, ProviderError> {
-        let body = serde_json::to_value(wire)?;
-        let response = self.http.post_json(CHAT_PATH, body).await?;
-        Ok(serde_json::from_value(response)?)
+    ) -> Result<WireResponse, ModelError> {
+        Ok(self.provider.post_json(CHAT_PATH, wire).await?)
     }
 
     /// 流式 chat completions。
@@ -61,12 +58,11 @@ impl OpenAiCompatible {
     pub async fn chat_completions_stream(
         &self,
         wire: &WireChatRequest,
-    ) -> Result<BoxStream<'static, WireStreamResponse>, ProviderError> {
+    ) -> Result<BoxStream<'static, WireStreamResponse>, ModelError> {
         let mut wire = wire.clone();
         wire.stream = Some(true);
 
-        let body = serde_json::to_value(&wire)?;
-        let mut events = self.http.post_sse(CHAT_PATH, body).await?;
+        let mut events = self.provider.post_sse(CHAT_PATH, &wire).await?;
 
         let decoded = async_stream::stream! {
             while let Some(event) = events.next().await {
@@ -209,9 +205,13 @@ impl GenAudioCapability for OpenAiCompatible {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    use futures::stream;
+    use crate::providers::Provider;
+    use crate::transport::{HttpRequest, HttpResponse, Transport, TransportError};
+    use bytes::Bytes;
     use serde_json::Value;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    pub const BASE_URL: &str = "https://fake.test/v1";
 
     #[derive(Default)]
     pub struct FakeTransport {
@@ -239,38 +239,65 @@ pub(crate) mod testing {
             })
         }
 
+        /// 记录到的 (url, body) 列表。
         pub fn recorded(&self) -> Vec<(String, Value)> {
             self.requests.lock().unwrap().clone()
         }
+
+        /// 记录到的请求路径（去掉 base_url 前缀）。
+        pub fn recorded_paths(&self) -> Vec<String> {
+            self.recorded()
+                .into_iter()
+                .map(|(url, _)| url.trim_start_matches(BASE_URL).to_string())
+                .collect()
+        }
+
+        /// 记录到的第一个请求体。
+        pub fn first_body(&self) -> Value {
+            self.recorded()
+                .into_iter()
+                .next()
+                .map(|(_, body)| body)
+                .unwrap_or(Value::Null)
+        }
+    }
+
+    /// 用假传输装出一个厂商端点。
+    pub fn fake_provider(transport: Arc<FakeTransport>) -> Provider {
+        Provider::new(transport, "fake", BASE_URL).with_bearer("test-key")
     }
 
     #[async_trait]
-    impl Provider for FakeTransport {
-        async fn post_json(&self, path: &str, body: Value) -> Result<Value, ProviderError> {
-            self.requests.lock().unwrap().push((path.to_string(), body));
-            self.json
-                .clone()
-                .ok_or_else(|| ProviderError::StreamError("no canned json".to_string()))
-        }
+    impl Transport for FakeTransport {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            let body = if request.body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&request.body).unwrap_or(Value::Null)
+            };
+            self.requests
+                .lock()
+                .unwrap()
+                .push((request.url.clone(), body));
 
-        async fn post_sse(
-            &self,
-            path: &str,
-            body: Value,
-        ) -> Result<BoxStream<'static, Result<String, ProviderError>>, ProviderError> {
-            self.requests.lock().unwrap().push((path.to_string(), body));
-            Ok(Box::pin(stream::iter(self.events.clone().into_iter().map(Ok))))
-        }
+            if let Some(json) = &self.json {
+                return Ok(HttpResponse::buffered(200, Bytes::from(json.to_string())));
+            }
 
-        fn name(&self) -> &str {
-            "fake"
+            let mut body = String::new();
+            for event in &self.events {
+                body.push_str("data: ");
+                body.push_str(event);
+                body.push_str("\n\n");
+            }
+            Ok(HttpResponse::buffered(200, Bytes::from(body)))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::FakeTransport;
+    use super::testing::{FakeTransport, fake_provider};
     use super::*;
     use crate::agent::ToolDef;
     use serde_json::{Value, json};
@@ -307,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn chat_posts_to_chat_completions_and_maps_to_domain_message() {
         let transport = FakeTransport::with_json(chat_wire_response("hello"));
-        let model = OpenAiCompatible::new(transport.clone());
+        let model = OpenAiCompatible::new(fake_provider(transport.clone()));
 
         let message = model
             .chat(ChatRequest::new("m", vec![Message::user("hi")]))
@@ -315,10 +342,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(message, Message::assistant("hello"));
-        let requests = transport.recorded();
-        assert_eq!(requests[0].0, "/chat/completions");
-        assert_eq!(requests[0].1["model"], "m");
-        assert!(requests[0].1.get("stream").is_none());
+        assert_eq!(transport.recorded_paths(), vec!["/chat/completions"]);
+        assert_eq!(transport.first_body()["model"], "m");
+        assert!(transport.first_body().get("stream").is_none());
     }
 
     #[tokio::test]
@@ -338,7 +364,7 @@ mod tests {
             })
             .to_string(),
         ]);
-        let model = OpenAiCompatible::new(transport);
+        let model = OpenAiCompatible::new(fake_provider(transport));
 
         let chunks = model
             .chat_stream(ChatRequest::new("m", vec![Message::user("hi")]))
@@ -358,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn stream_request_forces_stream_flag_at_the_protocol_layer() {
         let transport = FakeTransport::with_events(vec![]);
-        let model = OpenAiCompatible::new(transport.clone());
+        let model = OpenAiCompatible::new(fake_provider(transport.clone()));
 
         model
             .chat_stream(ChatRequest::new("m", vec![]))
@@ -367,7 +393,7 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
 
-        assert_eq!(transport.recorded()[0].1["stream"], true);
+        assert_eq!(transport.first_body()["stream"], true);
     }
 
     #[tokio::test]
@@ -376,7 +402,7 @@ mod tests {
             audio_chunk("abc", "hello "),
             audio_chunk("def", "world"),
         ]);
-        let model = OpenAiCompatible::new(transport.clone());
+        let model = OpenAiCompatible::new(fake_provider(transport.clone()));
 
         let response = model
             .gen_audio(GenAudioRequest::new(
@@ -390,8 +416,8 @@ mod tests {
         assert_eq!(response.transcript, "hello world");
         assert_eq!(response.format, "wav");
 
-        let (path, body) = transport.recorded().into_iter().next().unwrap();
-        assert_eq!(path, "/chat/completions");
+        let body = transport.first_body();
+        assert_eq!(transport.recorded_paths(), vec!["/chat/completions"]);
         assert_eq!(body["stream"], true);
         assert_eq!(body["modalities"], json!(["text", "audio"]));
         assert_eq!(body["audio"], json!({ "format": "wav" }));
@@ -401,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn tools_are_encoded_into_wire_format() {
         let transport = FakeTransport::with_json(chat_wire_response("ok"));
-        let model = OpenAiCompatible::new(transport.clone());
+        let model = OpenAiCompatible::new(fake_provider(transport.clone()));
 
         model
             .chat(
@@ -414,7 +440,7 @@ mod tests {
             .await
             .unwrap();
 
-        let body = &transport.recorded()[0].1;
+        let body = transport.first_body();
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");
         assert_eq!(body["tools"][0]["function"]["description"], "read a file");

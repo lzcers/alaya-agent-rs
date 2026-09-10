@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::providers::ProviderError;
+use crate::transport::TransportError;
 
 /// 模型调用错误。
 ///
@@ -8,8 +8,8 @@ use crate::providers::ProviderError;
 /// [`crate::router::ModelRouter`] 时出现，表示该模型没有注册这个能力。
 #[derive(Debug, Error)]
 pub enum ModelError {
-    #[error("Provider error: {0}")]
-    Provider(#[from] ProviderError),
+    #[error("Transport error: {0}")]
+    Transport(#[from] TransportError),
     #[error("No response from model")]
     NoResponse,
     #[error("Stream error: {0}")]
@@ -21,9 +21,18 @@ pub enum ModelError {
     },
 }
 
+/// 让厂商适配器可以直接对 serde 错误用 `?`。
+///
+/// 协议适配器要做 wire ↔ 域类型的编解码，这些错误与传输层的序列化错误同类，
+/// 因此复用 [`TransportError::Serialization`]，不再新增变体。
+impl From<serde_json::Error> for ModelError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Transport(TransportError::Serialization(error))
+    }
+}
+
 /// 把错误连同完整 cause 链格式化成一行，便于日志与上层展示。
-pub fn format_model_error(error: &ModelError) -> String {
-    let mut details = error.to_string();
+pub fn format_model_error(error: &ModelError) -> String {    let mut details = error.to_string();
     let mut source = std::error::Error::source(error);
     let mut index = 1;
 
@@ -45,13 +54,13 @@ mod tests {
     fn format_model_error_includes_error_chain_and_debug_details() {
         let serialization_error = serde_json::from_str::<serde_json::Value>("not-json")
             .expect_err("invalid JSON should fail");
-        let error = ModelError::Provider(ProviderError::Serialization(serialization_error));
+        let error = ModelError::Transport(TransportError::Serialization(serialization_error));
 
         let details = format_model_error(&error);
 
-        assert!(details.contains("Provider error: Serialization error:"));
+        assert!(details.contains("Transport error: Serialization error:"));
         assert!(details.contains("caused by #1: Serialization error:"));
         assert!(details.contains("caused by #2: expected ident"));
-        assert!(details.contains("debug: Provider(Serialization("));
+        assert!(details.contains("debug: Transport(Serialization("));
     }
 }

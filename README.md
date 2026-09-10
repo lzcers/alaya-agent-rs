@@ -54,22 +54,30 @@
     └─────┬───────────────────────────┘
           │
     ┌─────▼───────────────────────────┐
-    │  Provider (post_json / post_sse) │  传输层：URL / 认证 / 超时 / 代理 / SSE 分帧
-    │      → HttpProvider (reqwest)    │
+    │  Provider                        │  厂商身份：transport + base_url + headers
+    │   （值，不是 trait）              │  认证方案在这里，不在传输层
+    └─────┬───────────────────────────┘
+          │
+    ┌─────▼───────────────────────────┐
+    │  Transport                       │  传输层：send(HttpRequest) -> HttpResponse
+    │  HttpTransport (reqwest)         │  连接 / 超时 / 代理 / SSE 分帧，不认识厂商
     └──────────────────────────────────┘
 ```
 
 各层职责与依赖方向：
 
-| 层 | 模块 | 知道什么 | 不知道什么 |
-|----|------|----------|------------|
-| 传输层 | `providers` | URL、认证、超时、代理、SSE 分帧、HTTP 错误 | 任何业务操作（没有 `chat` / `generate_image` 方法） |
-| 协议层 | `protocols` | 端点路径、wire 结构体、厂商字段编码 | 模型名怎么路由、`base_url` |
-| 端点 | `endpoints` | `base_url`、默认请求头、厂商命名 | 协议形状、模型路由 |
-| 能力层 | `capability` | 域接口与域类型（`ChatRequest`、`ChatChunk`、`GenImgResponse`……） | HTTP、JSON 形状 |
-| 分发层 | `router` | 模型名 → 能力实现的映射 | 协议细节 |
+| 层 | 模块 | 形态 | 知道什么 | 不知道什么 |
+|----|------|------|----------|------------|
+| 分发层 | `router` | `ModelRouter` | 模型名 → 能力实现的映射 | 协议细节 |
+| 能力层 | `capability` | **trait** | 域接口与域类型（`ChatRequest`、`ChatChunk`、`GenImgResponse`……） | HTTP、JSON 形状 |
+| 协议层 | `protocols` | 适配器 | 端点路径、wire 结构体、厂商字段编码 | 模型名怎么路由、`base_url` |
+| 厂商 | `providers` | **值** | `base_url`、请求头、认证方案 | 端点路径、wire 形状、路由 |
+| 传输层 | `transport` | **trait** | 连接、超时、代理、SSE 分帧、HTTP 状态 | 厂商、密钥、业务操作 |
+| 目录 | `endpoints` | 组合根 | 厂商地址、命名、把能力接到正确的协议上 | — |
 
-`protocols` 里只有协议：DeepSeek 与 OpenRouter 的 chat/audio 都走 OpenAI 兼容协议，只有 OpenRouter 的图片端点走它自有的统一 schema。厂商的 `base_url` 与默认请求头属于端点配置，放在 `endpoints`。
+`protocols` 里只有协议：DeepSeek 与 OpenRouter 的 chat/audio 都走 OpenAI 兼容协议，只有 OpenRouter 的图片端点走它自有的统一 schema。厂商的 `base_url` 与请求头属于 `Provider`（一个值，不是 trait——厂商之间变化的是数据，不是行为）。
+
+依赖链：`router → capability ← protocols → providers → transport`。只有 `Transport` 是 trait（可以换实现：reqwest / 测试替身 / 其他栈）；越往上越具体。
 
 新增一种能力（embeddings、rerank、TTS……）只需在 `capability` 加一个 trait、在 `protocols` 加一个实现，传输层与分发层不用改。
 
@@ -269,38 +277,66 @@ handle.resume().await;
 handle.cancel().await;
 ```
 
-### 自定义传输
+### 接入新厂商
 
-`providers::Provider` 只有两个协议动词，实现它就能把模型调用接到任意 HTTP 栈上
-（测试替身、录制回放、自定义中间件）：
+| 厂商情况 | 需要实现 | 代码 |
+|----------|----------|------|
+| **兼容 OpenAI**（chat / audio） | **0 个 trait** | `endpoints::openai_compatible(name, key, base_url)` |
+| **兼容 OpenAI 且提供生图** | 目前需自己实现 `GenImgCapability`（内置只覆盖 OpenRouter 的图片形状） | 见 `tests/custom_vendor.rs` |
+| **自有协议**（Anthropic / Gemini） | 1 个 capability trait；认证非 Bearer 时再加 `Provider` | 见 `tests/custom_vendor.rs` |
 
 ```rust
-use alaya_agent::providers::{Provider, ProviderError};
-use futures::stream::BoxStream;
-use serde_json::Value;
+use alaya_agent::{endpoints::openai_compatible, router::ModelRouter};
+use std::sync::Arc;
+
+// 定义 base_url 与 key —— 这就是全部接入代码
+let model = Arc::new(openai_compatible(
+    "groq",
+    "your-api-key",
+    "https://api.groq.com/openai/v1",
+));
+
+let mut router = ModelRouter::new();
+router.add_chat_model("llama-3.3-70b-versatile", model.clone());
+router.add_audio_model("some-audio-model", model);
+```
+
+「声明它兼容 OpenAI」体现在两处类型化的选择上，而不是一个字符串：
+
+1. 用 `OpenAiCompatible` 作为适配器 → 声明走 OpenAI 协议；
+2. 注册到 `add_chat_model` / `add_audio_model` / `add_image_model` → 声明这个端点提供哪些能力。
+
+`tests/custom_vendor.rs` 是一份可执行的接入模板，两条路径都有完整示例。
+
+### 自定义传输
+
+`transport::Transport` 只有一个方法：**发一次请求**。响应体永远是字节流，怎么解释由调用方决定——所以二进制接口（TTS 的裸音频、文件上传）不需要给它加新方法。
+
+只在换掉 HTTP 栈时才需要实现它（测试替身、录制回放、gRPC/WebSocket）。**认证方案不需要自定义传输**——那是 `Provider::with_header` 的事：
+
+```rust
+use alaya_agent::transport::{HttpRequest, HttpResponse, Transport, TransportError};
 
 struct MyTransport;
 
 #[async_trait::async_trait]
-impl Provider for MyTransport {
-    async fn post_json(&self, path: &str, body: Value) -> Result<Value, ProviderError> {
-        // POST base_url + path
+impl Transport for MyTransport {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        // request.url / request.headers / request.body 都已由 Provider 备好
         todo!()
-    }
-
-    async fn post_sse(
-        &self,
-        path: &str,
-        body: Value,
-    ) -> Result<BoxStream<'static, Result<String, ProviderError>>, ProviderError> {
-        // POST 后把响应体切成 SSE 事件的 data 载荷
-        todo!()
-    }
-
-    fn name(&self) -> &str {
-        "my-transport"
     }
 }
+```
+
+```rust
+use alaya_agent::providers::Provider;
+use alaya_agent::transport::HttpTransport;
+use std::sync::Arc;
+
+// 非 Bearer 认证：换个头就行，不需要写传输层
+let provider = Provider::new(Arc::new(HttpTransport::new()), "anthropic", "https://api.anthropic.com/v1")
+    .with_header("x-api-key", api_key)
+    .with_header("anthropic-version", "2023-06-01");
 ```
 
 ## 模块说明
@@ -311,7 +347,8 @@ impl Provider for MyTransport {
 | `capability` | 能力层：`ChatCapability` / `GenImgCapability` / `GenAudioCapability` 及域请求/响应类型、`ModelError` |
 | `protocols` | 协议层：`OpenAiCompatible`（OpenAI 兼容 chat/audio）、`OpenRouterImages`（OpenRouter 图片 API） |
 | `endpoints` | 端点预设：`deepseek` / `openrouter` 构造函数（`base_url` + 默认请求头），把能力接到正确的协议上 |
-| `providers` | 传输层：`Provider` trait（`post_json` / `post_sse` / `name`）与 `HttpProvider` 实现、`ProviderError` |
+| `transport` | 传输层：`Transport` trait（`send`）、`HttpTransport`、`HttpRequest` / `HttpResponse`、SSE 分帧、`TransportError` |
+| `providers` | 厂商身份：`Provider`（transport + `base_url` + 请求头），一个值而非 trait |
 | `router` | 分发层：`ModelRouter` 按 (能力, 模型名) 查表转发 |
 | `agent::context` | 分层上下文容器 `Context`，支持 System / Soul / User / Memory / Conversation / Custom 层 |
 | `agent::agent_actor` | `AgentActor` 组合模型 + 工具，执行单步或后台循环；`AgentActorBuilder` 构建器 |

@@ -7,38 +7,26 @@
 pub mod wire;
 
 use async_trait::async_trait;
-use std::sync::Arc;
 
 use crate::capability::{GenImgCapability, GenImgRequest, GenImgResponse, ModelError};
-use crate::providers::{Provider, ProviderError};
+use crate::providers::Provider;
 
-use wire::{WireImageRequest, WireImageResponse, generated_image_to_url};
+use wire::{WireImageRequest, generated_image_to_url};
 
 const IMAGES_PATH: &str = "/images";
 
 /// OpenRouter 统一图片 API 适配器。
 pub struct OpenRouterImages {
-    http: Arc<dyn Provider>,
+    provider: Provider,
 }
 
 impl OpenRouterImages {
-    pub fn new(http: Arc<dyn Provider>) -> Self {
-        Self { http }
+    pub fn new(provider: Provider) -> Self {
+        Self { provider }
     }
 
-    /// 底层传输，便于测试与自定义。
-    pub fn http(&self) -> &Arc<dyn Provider> {
-        &self.http
-    }
-
-    /// 独立的图片生成端点。
-    pub async fn images(
-        &self,
-        wire: &WireImageRequest,
-    ) -> Result<WireImageResponse, ProviderError> {
-        let body = serde_json::to_value(wire)?;
-        let response = self.http.post_json(IMAGES_PATH, body).await?;
-        Ok(serde_json::from_value(response)?)
+    pub fn provider(&self) -> &Provider {
+        &self.provider
     }
 }
 
@@ -55,7 +43,8 @@ impl GenImgCapability for OpenRouterImages {
             resolution: request.resolution,
             aspect_ratio: request.aspect_ratio,
         };
-        let response = self.images(&wire).await?;
+        let response: wire::WireImageResponse =
+            self.provider.post_json(IMAGES_PATH, &wire).await?;
         let image_urls = response
             .data
             .into_iter()
@@ -73,7 +62,7 @@ impl GenImgCapability for OpenRouterImages {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::openai::testing::FakeTransport;
+    use crate::protocols::openai::testing::{FakeTransport, fake_provider};
     use serde_json::json;
 
     #[tokio::test]
@@ -81,7 +70,7 @@ mod tests {
         let transport = FakeTransport::with_json(json!({
             "data": [{ "b64_json": "aW1hZ2U=", "media_type": "image/webp" }]
         }));
-        let model = OpenRouterImages::new(transport.clone());
+        let model = OpenRouterImages::new(fake_provider(transport.clone()));
 
         let response = model
             .gen_img(
@@ -93,20 +82,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.image_urls, vec!["data:image/webp;base64,aW1hZ2U="]);
-        let requests = transport.recorded();
-        assert_eq!(requests[0].0, "/images");
-        assert_eq!(requests[0].1["model"], "krea/krea-2-medium-turbo");
-        assert_eq!(requests[0].1["prompt"], "cinematic landscape");
-        assert_eq!(requests[0].1["resolution"], "1K");
-        assert_eq!(requests[0].1["aspect_ratio"], "16:9");
-        assert!(requests[0].1.get("messages").is_none());
-        assert!(requests[0].1.get("size").is_none());
+        assert_eq!(transport.recorded_paths(), vec!["/images"]);
+        let body = transport.first_body();
+        assert_eq!(body["model"], "krea/krea-2-medium-turbo");
+        assert_eq!(body["prompt"], "cinematic landscape");
+        assert_eq!(body["resolution"], "1K");
+        assert_eq!(body["aspect_ratio"], "16:9");
+        assert!(body.get("messages").is_none());
+        assert!(body.get("size").is_none());
     }
 
     #[tokio::test]
     async fn gen_img_rejects_empty_prompt_without_calling_transport() {
         let transport = FakeTransport::with_json(json!({ "data": [] }));
-        let model = OpenRouterImages::new(transport.clone());
+        let model = OpenRouterImages::new(fake_provider(transport.clone()));
 
         let error = model
             .gen_img(GenImgRequest::new("m", "   "))

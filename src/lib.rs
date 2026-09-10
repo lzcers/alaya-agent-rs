@@ -6,6 +6,7 @@ pub mod message;
 pub mod protocols;
 pub mod providers;
 pub mod router;
+pub mod transport;
 pub mod usage;
 
 pub use message::{Message, MessageRole};
