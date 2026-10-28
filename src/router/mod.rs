@@ -159,7 +159,10 @@ mod tests {
 
     #[async_trait]
     impl GenAudioCapability for StubAudio {
-        async fn gen_audio(&self, _request: GenAudioRequest) -> Result<GenAudioResponse, ModelError> {
+        async fn gen_audio(
+            &self,
+            _request: GenAudioRequest,
+        ) -> Result<GenAudioResponse, ModelError> {
             Ok(GenAudioResponse {
                 audio_data: "stub".to_string(),
                 transcript: String::new(),

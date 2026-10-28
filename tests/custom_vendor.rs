@@ -212,7 +212,10 @@ async fn a_custom_protocol_vendor_needs_one_capability_trait() {
     let seen = transport.seen();
     assert_eq!(seen[0].url, "https://api.acme.test/v1/generate");
     assert_eq!(seen[0].body["engine"], "acme-large");
-    assert!(seen[0].body.get("model").is_none(), "不应泄漏 OpenAI 字段名");
+    assert!(
+        seen[0].body.get("model").is_none(),
+        "不应泄漏 OpenAI 字段名"
+    );
     assert_eq!(seen[1].url, "https://api.acme.test/v1/generate:stream");
 
     // 非 Bearer 认证：只有 Acme 自己的头，没有多余的 Authorization

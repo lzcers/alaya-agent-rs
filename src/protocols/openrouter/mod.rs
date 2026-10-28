@@ -43,8 +43,7 @@ impl GenImgCapability for OpenRouterImages {
             resolution: request.resolution,
             aspect_ratio: request.aspect_ratio,
         };
-        let response: wire::WireImageResponse =
-            self.provider.post_json(IMAGES_PATH, &wire).await?;
+        let response: wire::WireImageResponse = self.provider.post_json(IMAGES_PATH, &wire).await?;
         let image_urls = response
             .data
             .into_iter()

@@ -246,10 +246,12 @@ mod tests {
     #[async_trait]
     impl Transport for RoutingTransport {
         async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-            self.paths
-                .lock()
-                .unwrap()
-                .push(request.url.trim_start_matches("https://fake.test").to_string());
+            self.paths.lock().unwrap().push(
+                request
+                    .url
+                    .trim_start_matches("https://fake.test")
+                    .to_string(),
+            );
 
             let body = if request.url.ends_with("/images") {
                 json!({ "data": [{ "b64_json": "aW1hZ2U=", "media_type": "image/png" }] })

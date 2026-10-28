@@ -54,7 +54,9 @@ pub(crate) fn drain_events(buffer: &mut Vec<u8>) -> Vec<String> {
 /// 把响应体字节流切成 SSE 事件的 `data` 载荷流。
 ///
 /// 中途的读取失败以 `Err` 形式出现在流里并终止流。
-pub fn data_events(mut body: BodyStream) -> impl futures::Stream<Item = Result<String, TransportError>> {
+pub fn data_events(
+    mut body: BodyStream,
+) -> impl futures::Stream<Item = Result<String, TransportError>> {
     async_stream::stream! {
         let mut buffer = Vec::new();
 

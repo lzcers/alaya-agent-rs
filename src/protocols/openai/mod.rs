@@ -23,9 +23,7 @@ use crate::capability::{
 use crate::message::ToolCall;
 use crate::providers::Provider;
 
-use wire::{
-    WireAudioConfig, WireChatRequest, WireResponse, WireStreamResponse, WireToolCall,
-};
+use wire::{WireAudioConfig, WireChatRequest, WireResponse, WireStreamResponse, WireToolCall};
 
 const CHAT_PATH: &str = "/chat/completions";
 
@@ -470,7 +468,10 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["modalities"], json!(["text", "audio"]));
         assert_eq!(body["audio"], json!({ "format": "wav" }));
-        assert_eq!(body["messages"][0]["content"], "Generate a short piano loop");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "Generate a short piano loop"
+        );
     }
 
     #[tokio::test]
@@ -543,10 +544,7 @@ mod tests {
             },
         ];
 
-        model
-            .chat(ChatRequest::new("m", messages))
-            .await
-            .unwrap();
+        model.chat(ChatRequest::new("m", messages)).await.unwrap();
 
         // 域形状 {id, name, arguments} → wire 嵌套 {type, function:{name, arguments 文本}}
         let body = transport.first_body();

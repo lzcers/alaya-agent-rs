@@ -53,8 +53,9 @@ mod tests {
 
     #[test]
     fn image_options_belong_to_the_request() {
-        let request =
-            GenImgRequest::new("model", "prompt").with_aspect_ratio("16:9").with_resolution("2K");
+        let request = GenImgRequest::new("model", "prompt")
+            .with_aspect_ratio("16:9")
+            .with_resolution("2K");
 
         assert_eq!(request.aspect_ratio.as_deref(), Some("16:9"));
         assert_eq!(request.resolution.as_deref(), Some("2K"));

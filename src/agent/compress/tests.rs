@@ -7,9 +7,7 @@ use crate::agent::compress::{
     ChatSummaryModel, ConversationRule, LayerAction, LayerRule, LayerSelector, ModelCompression,
     RuleCompression, SummaryModel,
 };
-use crate::agent::{
-    Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall,
-};
+use crate::agent::{Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall};
 use crate::capability::{ChatCapability, ChatChunk, ChatRequest, ModelError};
 use futures::stream::{self, BoxStream};
 

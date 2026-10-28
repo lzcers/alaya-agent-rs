@@ -39,7 +39,11 @@ impl HttpRequest {
         Self::new(Method::POST, url)
     }
 
-    pub fn with_header(mut self, name: &str, value: impl AsRef<str>) -> Result<Self, TransportError> {
+    pub fn with_header(
+        mut self,
+        name: &str,
+        value: impl AsRef<str>,
+    ) -> Result<Self, TransportError> {
         let name = HeaderName::try_from(name)
             .map_err(|e| TransportError::InvalidRequest(format!("invalid header name: {e}")))?;
         let value = HeaderValue::from_str(value.as_ref())
@@ -49,7 +53,10 @@ impl HttpRequest {
     }
 
     /// 用 JSON 作为请求体，并带上 `Content-Type`。
-    pub fn with_json_body<T: Serialize + ?Sized>(mut self, body: &T) -> Result<Self, TransportError> {
+    pub fn with_json_body<T: Serialize + ?Sized>(
+        mut self,
+        body: &T,
+    ) -> Result<Self, TransportError> {
         let encoded = serde_json::to_vec(body)?;
         self.headers
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -159,7 +166,10 @@ mod tests {
             .with_json_body(&json!({ "a": 1 }))
             .unwrap();
 
-        assert_eq!(request.headers.get(CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(
+            request.headers.get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
             json!({ "a": 1 })
@@ -171,7 +181,10 @@ mod tests {
         let response = HttpResponse::buffered(200, Bytes::from_static(b"{\"ok\":true}"));
 
         assert!(response.is_success());
-        assert_eq!(response.json::<serde_json::Value>().await.unwrap()["ok"], true);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["ok"],
+            true
+        );
     }
 
     #[tokio::test]
@@ -181,9 +194,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(request.body.len(), 3);
-        assert_eq!(
-            request.headers.get(CONTENT_TYPE).unwrap(),
-            "audio/mpeg"
-        );
+        assert_eq!(request.headers.get(CONTENT_TYPE).unwrap(), "audio/mpeg");
     }
 }

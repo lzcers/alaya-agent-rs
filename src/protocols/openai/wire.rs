@@ -133,7 +133,10 @@ pub enum WireMessage {
         tool_calls: Option<Vec<WireToolCall>>,
     },
     #[serde(rename = "tool")]
-    Tool { tool_call_id: String, content: String },
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
 }
 
 impl From<&Message> for WireMessage {
@@ -179,12 +182,8 @@ impl From<WireMessage> for Message {
             } => Self::Assistant {
                 content,
                 reasoning_content,
-                tool_calls: tool_calls.map(|calls| {
-                    calls
-                        .into_iter()
-                        .map(WireToolCall::into_domain)
-                        .collect()
-                }),
+                tool_calls: tool_calls
+                    .map(|calls| calls.into_iter().map(WireToolCall::into_domain).collect()),
             },
             WireMessage::Tool {
                 tool_call_id,
@@ -839,5 +838,4 @@ mod tests {
         assert!(wire.get("stream").is_none());
         assert!(wire.get("modalities").is_none());
     }
-
 }
