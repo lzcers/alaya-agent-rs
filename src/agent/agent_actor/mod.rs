@@ -13,47 +13,43 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::{AgentState, Context, Metrics, ToolExecutor};
-use crate::capability::{ChatCapability, ChatRequest};
+use crate::capability::{GenerateCapability, GenerateRequest};
 
 pub use builder::AgentActorBuilder;
 pub use loop_control::LoopState;
 pub use types::{AgentActorCommand, AgentActorEvent, AgentActorHandle, AgentError, StepResult};
 
-/// Agent Actor 负责组合模型、工具执行器和运行配置。
-///
-/// 具体的 step 执行、loop 控制与 builder 逻辑分别位于子模块中，
-/// 这里保留核心状态和最小化的公共 API。
-pub struct AgentActor<C, E>
+/// Agent Actor 负责组合统一多模态模型、工具执行器和运行配置。
+pub struct AgentActor<M, E>
 where
-    C: ChatCapability + Send + Sync + 'static,
+    M: GenerateCapability + Send + Sync + 'static,
     E: ToolExecutor + Send + 'static,
 {
     /// Agent 状态（控制面）
     state: AgentState,
-    /// Chat 模型
-    chat: Arc<C>,
-    /// 每次 step 使用的 Chat 请求配置；messages 和 tools 会在调用前刷新。
-    chat_request: ChatRequest,
+    /// 多模态生成模型
+    model: Arc<M>,
+    /// 每次 step 使用的生成请求模板；messages 和 tools 会在调用前刷新。
+    request: GenerateRequest,
     /// 工具执行器
     tool_executor: Arc<E>,
     /// 等待中的用户输入
     pending_user_input: Option<(String, mpsc::Sender<AgentActorEvent>)>,
 }
 
-impl<C, E> AgentActor<C, E>
+impl<M, E> AgentActor<M, E>
 where
-    C: ChatCapability + Send + Sync,
+    M: GenerateCapability + Send + Sync,
     E: ToolExecutor + Send,
 {
     /// 创建新的 Agent Actor
-    pub fn new(chat: C, chat_request: ChatRequest, tool_executor: E, context: Context) -> Self {
-        Self::with_runtime_hooks(chat, chat_request, tool_executor, context)
+    pub fn new(model: M, request: GenerateRequest, tool_executor: E, context: Context) -> Self {
+        Self::with_runtime_hooks(model, request, tool_executor, context)
     }
 
-    /// 创建带内部 runtime hooks 和扩展 hooks 的 Agent Actor
     pub(crate) fn with_runtime_hooks(
-        chat: C,
-        chat_request: ChatRequest,
+        model: M,
+        request: GenerateRequest,
         tool_executor: E,
         context: Context,
     ) -> Self {
@@ -70,41 +66,35 @@ where
                 context,
                 metrics: Metrics::with_max_iterations(default_max_iterations),
             },
-            chat: Arc::new(chat),
-            chat_request,
+            model: Arc::new(model),
+            request,
             tool_executor: Arc::new(tool_executor),
             pending_user_input: None,
         }
     }
 
-    /// 获取状态
     pub fn state(&self) -> &AgentState {
         &self.state
     }
 
-    /// 获取可变状态
     pub fn state_mut(&mut self) -> &mut AgentState {
         &mut self.state
     }
 
-    /// 获取上下文
     pub fn context(&self) -> &Context {
         &self.state.context
     }
 
-    /// 获取可变上下文
     pub fn context_mut(&mut self) -> &mut Context {
         &mut self.state.context
     }
 
-    /// 发送事件（忽略发送失败）
     async fn send_event(event_tx: Option<&mpsc::Sender<AgentActorEvent>>, event: AgentActorEvent) {
         if let Some(tx) = event_tx {
             let _ = tx.send(event).await;
         }
     }
 
-    /// 触发用户输入请求
     pub async fn ask_user(
         &mut self,
         question: String,
@@ -128,7 +118,6 @@ where
         LoopState::WaitingForUserInput(input_id)
     }
 
-    /// 检查是否有等待中的用户输入
     pub fn has_pending_user_input(&self) -> bool {
         self.pending_user_input.is_some()
     }

@@ -1,6 +1,9 @@
-use crate::Usage;
 use crate::agent::{ToolCall, ToolExecutor};
-use crate::capability::{ChatCapability, ChatRequest, format_model_error};
+use crate::capability::{
+    FinishReason, GenerateCapability, GenerateRequest, PartDelta, StreamAccumulator, StreamEvent,
+    format_model_error,
+};
+use crate::{ContentPart, Message, Usage};
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -24,90 +27,88 @@ pub enum CallToolError {
     Timeout,
 }
 
-/// 调用模型事件（纯数据）
+/// 调用模型事件（纯数据，支持多模态流式输出）
 #[derive(Debug, Clone)]
 pub enum CallModelEvent {
-    /// LLM 文本片段
+    /// 文本增量片段
     TextChunk(String),
-    /// 推理片段
+    /// 推理增量片段
     ReasoningChunk(String),
-    /// LLM 响应完成
-    Completed {
-        /// 完整的响应内容
-        content: String,
-        /// 完整的推理内容（如果有）
-        reasoning_content: Option<String>,
-        /// 工具调用列表（如果有）
-        tools_call: Option<Vec<ToolCall>>,
-        /// 模型接口返回的 token 用量
-        usage: Option<Usage>,
+    /// 音频增量片段
+    AudioChunk {
+        data: Option<String>,
+        transcript: Option<String>,
+        format: Option<String>,
     },
+    /// 已产出的完整内容块（工具调用、图片、文件等）
+    PartCompleted(ContentPart),
+    /// 模型响应完整结束
+    Completed {
+        message: Message,
+        usage: Option<Usage>,
+        finish_reason: Option<FinishReason>,
+    },
+    /// 调用或流式传输错误
     Error(String),
 }
 
-// 调用一个具备 chat 能力的模型，至少要实现 chat_stream 方法
+/// 调用具备统一生成能力的模型，流式转发增量并归并完整的 [`Message`]。
 pub fn call_model(
-    model: &(dyn ChatCapability + Sync),
-    request: ChatRequest,
+    model: &(dyn GenerateCapability + Sync),
+    request: GenerateRequest,
 ) -> impl Stream<Item = CallModelEvent> {
-    let mut final_content = String::new();
-    let mut final_reasoning_content = String::new();
-    let mut final_tool_calls = Vec::new();
-    let mut final_usage = None;
     stream! {
-        let mut completed = false;
-        // 流式调用模型
-        let mut response_stream = match model.chat_stream(request).await {
+        let mut response_stream = match model.generate_stream(request).await {
             Ok(s) => s,
             Err(e) => {
                 yield CallModelEvent::Error(format_model_error(&e));
                 return;
             }
         };
-        while let Some(chunk) = response_stream.next().await {
-                let should_finish = chunk.is_finished || chunk.finish_reason.is_some();
-                let content = chunk.content;
-                let reasoning_content = chunk.reasoning_content;
-                let tool_calls = chunk.tool_calls;
-                let usage = chunk.usage;
-                if !content.is_empty() {
-                    final_content.push_str(&content);
-                    yield CallModelEvent::TextChunk(content);
-                }
 
-                if !reasoning_content.is_empty() {
-                    final_reasoning_content.push_str(&reasoning_content);
-                    yield CallModelEvent::ReasoningChunk(reasoning_content);
+        let mut acc = StreamAccumulator::new();
+        while let Some(item) = response_stream.next().await {
+            let event = match item {
+                Ok(event) => event,
+                Err(e) => {
+                    yield CallModelEvent::Error(format_model_error(&e));
+                    return;
                 }
-
-                // 协议层已经交付累积快照，这里直接替换。
-                if let Some(snapshot) = tool_calls {
-                    final_tool_calls = snapshot;
-                }
-
-                if let Some(usage) = usage {
-                    final_usage = Some(usage);
-                }
-
-                if should_finish {
-                    completed = true;
-                    yield CallModelEvent::Completed {
-                        content: final_content.clone(),
-                        reasoning_content: if final_reasoning_content.is_empty() { None } else { Some(final_reasoning_content.clone()) },
-                        tools_call: if final_tool_calls.is_empty() { None } else { Some(final_tool_calls.clone()) },
-                        usage: final_usage.clone(),
-                    };
-                    break;
-                }
-        }
-        if !completed {
-            yield CallModelEvent::Completed {
-                content: final_content,
-                reasoning_content: if final_reasoning_content.is_empty() { None } else { Some(final_reasoning_content) },
-                tools_call: if final_tool_calls.is_empty() { None } else { Some(final_tool_calls) },
-                usage: final_usage,
             };
+
+            acc.push(&event);
+
+            match event {
+                StreamEvent::Delta(PartDelta::Text { text }) if !text.is_empty() => {
+                    yield CallModelEvent::TextChunk(text);
+                }
+                StreamEvent::Delta(PartDelta::Reasoning { text }) if !text.is_empty() => {
+                    yield CallModelEvent::ReasoningChunk(text);
+                }
+                StreamEvent::Delta(PartDelta::Audio {
+                    data,
+                    transcript,
+                    format,
+                }) => {
+                    yield CallModelEvent::AudioChunk {
+                        data,
+                        transcript,
+                        format,
+                    };
+                }
+                StreamEvent::Part(part) => {
+                    yield CallModelEvent::PartCompleted(part);
+                }
+                StreamEvent::Delta(_) | StreamEvent::Usage(_) | StreamEvent::Finished { .. } => {}
+            }
         }
+
+        let response = acc.finish();
+        yield CallModelEvent::Completed {
+            message: response.message,
+            usage: response.usage,
+            finish_reason: response.finish_reason,
+        };
     }
 }
 
@@ -146,7 +147,7 @@ pub async fn call_tool(tool_executor: &dyn ToolExecutor, call: &ToolCall) -> Cal
     }
 }
 
-// 并行执行多个工具
+/// 并行执行多个工具
 pub fn call_tools(
     tool_executor: &dyn ToolExecutor,
     tools_call: &[ToolCall],
@@ -166,65 +167,52 @@ pub fn call_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Message,
-        capability::{ChatChunk, ModelError},
-    };
+    use crate::capability::{GenerateResponse, GenerateStream, ModelError};
     use async_trait::async_trait;
-    use futures::{StreamExt, stream, stream::BoxStream};
+    use futures::{StreamExt, stream};
 
-    struct MockChatModel {
-        chunks: Vec<ChatChunk>,
+    struct MockModel {
+        events: Vec<StreamEvent>,
     }
 
     #[async_trait]
-    impl ChatCapability for MockChatModel {
-        async fn chat(&self, _request: ChatRequest) -> Result<Message, ModelError> {
-            panic!("chat should not be called in this test");
+    impl GenerateCapability for MockModel {
+        async fn generate(&self, _request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
+            panic!("generate should not be called in this test");
         }
 
-        async fn chat_stream(
+        async fn generate_stream(
             &self,
-            _request: ChatRequest,
-        ) -> Result<BoxStream<'static, ChatChunk>, ModelError> {
-            Ok(Box::pin(stream::iter(self.chunks.clone())))
+            _request: GenerateRequest,
+        ) -> Result<GenerateStream, ModelError> {
+            let items: Vec<Result<StreamEvent, ModelError>> =
+                self.events.iter().cloned().map(Ok).collect();
+            Ok(Box::pin(stream::iter(items)))
         }
     }
 
     #[tokio::test]
-    async fn call_model_completes_immediately_on_finish_chunk() {
-        let model = MockChatModel {
-            chunks: vec![
-                ChatChunk {
-                    content: "hello".to_string(),
-                    reasoning_content: String::new(),
-                    is_finished: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    usage: None,
+    async fn call_model_captures_usage_emitted_after_finished_event() {
+        let model = MockModel {
+            events: vec![
+                StreamEvent::Delta(PartDelta::Text {
+                    text: "hello".to_string(),
+                }),
+                StreamEvent::Finished {
+                    reason: Some(FinishReason::Stop),
                 },
-                ChatChunk {
-                    content: String::new(),
-                    reasoning_content: String::new(),
-                    is_finished: true,
-                    finish_reason: Some("stop".to_string()),
-                    tool_calls: None,
-                    usage: None,
-                },
-                ChatChunk {
-                    content: "should-not-be-consumed".to_string(),
-                    reasoning_content: String::new(),
-                    is_finished: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    usage: None,
-                },
+                StreamEvent::Usage(Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                    ..Usage::default()
+                }),
             ],
         };
 
         let events = call_model(
             &model,
-            ChatRequest::new("mock-model", vec![Message::user("hi")]),
+            GenerateRequest::new("mock-model", vec![Message::user("hi")]),
         )
         .collect::<Vec<_>>()
         .await;
@@ -233,8 +221,12 @@ mod tests {
             events.as_slice(),
             [
                 CallModelEvent::TextChunk(text),
-                CallModelEvent::Completed { content: completed, .. }
-            ] if text == "hello" && completed == "hello"
+                CallModelEvent::Completed {
+                    message,
+                    usage: Some(usage),
+                    finish_reason: Some(FinishReason::Stop),
+                }
+            ] if text == "hello" && message.text() == "hello" && usage.total_tokens == 15
         ));
     }
 }

@@ -4,10 +4,10 @@ use tokio::sync::mpsc;
 
 use super::lifecycle::{LifeCycleFlow, LifeCycleInterrupt, LifeCycleResult, StepLifeCycle};
 use super::{AgentActor, AgentActorCommand, AgentActorEvent, AgentActorHandle, StepResult};
-use crate::Message;
 use crate::agent::agent_actor::lifecycle::StepFrame;
 use crate::agent::{AgentError, AgentTerminalReason, JobState, ToolExecutor};
-use crate::capability::ChatCapability;
+use crate::capability::GenerateCapability;
+use crate::{ContentPart, Message};
 
 #[derive(Clone)]
 pub enum LoopState {
@@ -23,36 +23,25 @@ pub enum Finalization {
     Silent,
 }
 
-impl<C, E> AgentActor<C, E>
+impl<M, E> AgentActor<M, E>
 where
-    C: ChatCapability + Send + Sync,
+    M: GenerateCapability + Send + Sync,
     E: ToolExecutor + Send,
 {
-    /// 执行单步迭代
-    ///
-    /// # Arguments
-    /// * `event_tx` - 可选的事件发送器，用于报告执行过程中的各种事件
-    ///
-    /// # Returns
-    /// 返回 `StepResult` 表示执行结果：
-    /// - `Continue`: 有工具调用，需要继续迭代
-    /// - `Done`: 无工具调用，执行完成
-    /// - `Error`: 执行出错
     pub async fn run_step(
         &mut self,
         event_tx: Option<mpsc::Sender<AgentActorEvent>>,
     ) -> StepResult {
         self.state.state = JobState::Running;
         self.state.metrics.mark_started();
-        let chat = Arc::clone(&self.chat);
+        let model = Arc::clone(&self.model);
         let tool_executor = Arc::clone(&self.tool_executor);
         let mut lifecycle = StepLifeCycle::new(self.state.clone());
 
-        // 执行生命周期函数
         let lifecycle_flow = lifecycle
             .start(
-                chat.as_ref(),
-                &self.chat_request,
+                model.as_ref(),
+                &self.request,
                 tool_executor.as_ref(),
                 event_tx.as_ref(),
             )
@@ -62,40 +51,28 @@ where
             LifeCycleFlow::Continue(LifeCycleResult::Frame(frame)) => {
                 self.apply_step_metrics(&frame);
                 let result = Self::step_result_from_frame(&frame);
-                // 应用 StepFrame 结果，更新 AgentState
                 self.apply_step_result(&result);
-                // 对外发送 StepResult 事件
                 self.emit_step_result_events(event_tx.as_ref(), &frame, &result)
                     .await;
                 result
             }
-            LifeCycleFlow::Break(interrupt) => {
-                match interrupt {
-                    // 如果是 AskUser 中断，返回成功结果
-                    LifeCycleInterrupt::AskUser { question } => {
-                        // 触发用户输入请求，进入 WaitingForUserInput 状态
-                        self.ask_user(question, event_tx).await;
-                        // 返回 Continue 结果，让 loop 继续处理状态转换
-                        // 注意：这里我们没有完整的 model_output，但这不影响状态转换
-                        StepResult::Continue {
-                            content: String::new(),
-                            reasoning_content: None,
-                            tools_call: Vec::new(),
-                            tools_result: Vec::new(),
-                        }
-                    }
-                    // 其他中断（错误）返回错误
-                    _ => {
-                        // 将 LifeCycleInterrupt 转换为 AgentError
-                        let err = AgentError::Parse(interrupt);
-                        self.apply_step_error(&err);
-                        self.emit_error_events(event_tx.as_ref(), &err).await;
-                        StepResult::Error(err)
+            LifeCycleFlow::Break(interrupt) => match interrupt {
+                LifeCycleInterrupt::AskUser { question } => {
+                    self.ask_user(question, event_tx).await;
+                    StepResult::Continue {
+                        message: Message::assistant(""),
+                        tools_call: Vec::new(),
+                        tools_result: Vec::new(),
                     }
                 }
-            }
+                _ => {
+                    let err = AgentError::Parse(interrupt);
+                    self.apply_step_error(&err);
+                    self.emit_error_events(event_tx.as_ref(), &err).await;
+                    StepResult::Error(err)
+                }
+            },
             _ => {
-                // 其他情况视为模型错误
                 let err = AgentError::Parse(LifeCycleInterrupt::ModelError);
                 self.apply_step_error(&err);
                 self.emit_error_events(event_tx.as_ref(), &err).await;
@@ -104,12 +81,6 @@ where
         }
     }
 
-    /// 启动循环执行，返回控制句柄
-    ///
-    /// 此方法启动后台任务执行循环，直到完成或被打断。
-    /// 返回的控制句柄可用于暂停、继续、取消等操作。
-    ///
-    /// 如果需要手动控制每一步执行，请使用 `run_step` 方法。
     pub fn run_loop(mut self) -> AgentActorHandle {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<AgentActorCommand>(16);
         let (event_tx, event_rx) = mpsc::channel::<AgentActorEvent>(64);
@@ -202,8 +173,6 @@ where
         }
     }
 
-    // 两种改变 Agent 执行状态的方法
-    // 1. 接受外部 Command 改变内部运行状态
     fn transition_command(&mut self, loop_state: LoopState, cmd: AgentActorCommand) -> LoopState {
         match loop_state {
             LoopState::Runnable => match cmd {
@@ -244,9 +213,7 @@ where
             LoopState::WaitingForUserInput(expected_input_id) => match cmd {
                 AgentActorCommand::UserInput { input, input_id } => {
                     if input_id == expected_input_id {
-                        self.state
-                            .context
-                            .add_message(Message::user(input));
+                        self.state.context.add_message(Message::user(input));
                         self.state.state = JobState::Running;
                         self.pending_user_input = None;
                         LoopState::Runnable
@@ -268,15 +235,11 @@ where
         }
     }
 
-    // 2. 根据单步执行的结果改变运行状态
     fn transition_step_result(&self, result: StepResult) -> LoopState {
         match result {
             StepResult::Continue { tools_call, .. } => {
-                // 检查是否有 AskUser 工具调用
                 if tools_call.iter().any(|tool| tool.name == "ask_user") {
-                    // 如果有 AskUser 工具调用，检查是否已经设置了 pending_user_input
                     if self.has_pending_user_input() {
-                        // 从 pending_user_input 中获取 input_id
                         if let Some((input_id, _)) = &self.pending_user_input {
                             LoopState::WaitingForUserInput(input_id.clone())
                         } else {
@@ -318,37 +281,26 @@ where
     fn apply_step_result(&mut self, result: &StepResult) {
         match result {
             StepResult::Continue {
-                content,
-                reasoning_content,
-                tools_call,
+                message,
                 tools_result,
+                ..
             } => {
                 self.state.metrics.increment_iteration();
                 self.state.state = JobState::Running;
-                self.state.context.add_message(Message::Assistant {
-                    content: content.clone(),
-                    reasoning_content: reasoning_content.clone(),
-                    tool_calls: Some(tools_call.clone()),
-                });
+                self.state.context.add_message(message.clone());
 
                 for tool_result in tools_result {
-                    self.state.context.add_message(Message::Tool {
-                        tool_call_id: tool_result.call_id.clone(),
-                        content: tool_result.output.clone(),
-                    });
+                    self.state.context.add_message(Message::tool_result_parts(
+                        tool_result.call_id.clone(),
+                        vec![ContentPart::text(tool_result.output.clone())],
+                        !tool_result.success,
+                    ));
                 }
             }
-            StepResult::Done {
-                content,
-                reasoning_content,
-            } => {
+            StepResult::Done { message } => {
                 self.state.metrics.increment_iteration();
                 self.state.state = JobState::Completed;
-                self.state.context.add_message(Message::Assistant {
-                    content: content.clone(),
-                    reasoning_content: reasoning_content.clone(),
-                    tool_calls: None,
-                });
+                self.state.context.add_message(message.clone());
                 self.state
                     .metrics
                     .mark_finished(AgentTerminalReason::Completed);
@@ -397,16 +349,14 @@ where
 
     fn step_result_from_frame(frame: &StepFrame) -> StepResult {
         match frame.model_output.as_ref() {
-            Some(model_output) => match model_output.tools_call.as_ref() {
+            Some(model_output) => match frame.get_tools_call() {
                 Some(tools_call) => StepResult::Continue {
-                    content: model_output.content.clone(),
-                    reasoning_content: model_output.reasoning_content.clone(),
-                    tools_call: tools_call.clone(),
+                    message: model_output.message.clone(),
+                    tools_call,
                     tools_result: frame.tools_result.clone().unwrap_or_default(),
                 },
                 None => StepResult::Done {
-                    content: model_output.content.clone(),
-                    reasoning_content: model_output.reasoning_content.clone(),
+                    message: model_output.message.clone(),
                 },
             },
             None => StepResult::Error(AgentError::ModelRspErr),

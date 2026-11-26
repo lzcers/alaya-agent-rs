@@ -8,5 +8,5 @@ pub mod router;
 pub mod transport;
 pub mod usage;
 
-pub use message::{ContentPart, ImageUrl, Message, MessageRole, UserContent};
+pub use message::{ContentPart, MediaSource, Message, MessageRole, Modality, ToolCall, ToolDef};
 pub use usage::Usage;

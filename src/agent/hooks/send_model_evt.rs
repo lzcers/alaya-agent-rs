@@ -35,15 +35,18 @@ impl LifeCycleHook for SendModelEvtHook {
             CallModelEvent::ReasoningChunk(content) => {
                 AgentActorEvent::ReasoningChunk(content.clone())
             }
-            CallModelEvent::Completed {
-                content,
-                reasoning_content,
-                tools_call,
-                ..
-            } => AgentActorEvent::StepCompleted {
-                content: content.clone(),
-                reasoning_content: reasoning_content.clone(),
-                tool_calls: tools_call.clone(),
+            CallModelEvent::AudioChunk {
+                data,
+                transcript,
+                format,
+            } => AgentActorEvent::AudioChunk {
+                data: data.clone(),
+                transcript: transcript.clone(),
+                format: format.clone(),
+            },
+            CallModelEvent::PartCompleted(part) => AgentActorEvent::PartCompleted(part.clone()),
+            CallModelEvent::Completed { message, .. } => AgentActorEvent::StepCompleted {
+                message: message.clone(),
             },
             CallModelEvent::Error(message) => AgentActorEvent::HookEvent {
                 hook: "call_model".to_string(),

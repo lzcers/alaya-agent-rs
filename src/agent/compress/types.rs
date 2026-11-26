@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::Message;
 use crate::agent::memory::MemoryError;
 use crate::agent::{Layer, LayerKind};
-use crate::capability::{ChatCapability, ChatRequest, ModelError};
+use crate::capability::{GenerateCapability, GenerateRequest, ModelError};
+use crate::{Message, MessageRole};
 
 #[async_trait]
 pub trait SummaryModel: Send + Sync {
@@ -152,16 +152,16 @@ impl Default for ModelCompression {
     }
 }
 
-pub struct ChatSummaryModel<'a, C> {
-    chat: &'a C,
-    request: ChatRequest,
+pub struct GenerateSummaryModel<'a, M> {
+    model: &'a M,
+    request: GenerateRequest,
     system_prompt: String,
 }
 
-impl<'a, C> ChatSummaryModel<'a, C> {
-    pub fn new(chat: &'a C, request: ChatRequest) -> Self {
+impl<'a, M> GenerateSummaryModel<'a, M> {
+    pub fn new(model: &'a M, request: GenerateRequest) -> Self {
         Self {
-            chat,
+            model,
             request,
             system_prompt: DEFAULT_SUMMARY_SYSTEM_PROMPT.to_string(),
         }
@@ -174,23 +174,26 @@ impl<'a, C> ChatSummaryModel<'a, C> {
 }
 
 #[async_trait]
-impl<C> SummaryModel for ChatSummaryModel<'_, C>
+impl<M> SummaryModel for GenerateSummaryModel<'_, M>
 where
-    C: ChatCapability + Send + Sync,
+    M: GenerateCapability + Send + Sync,
 {
     async fn summarize(&self, prompt: &str) -> Result<String, ModelError> {
         let response = self
-            .chat
-            .chat(self.request.clone().with_messages(vec![
+            .model
+            .generate(self.request.clone().with_messages(vec![
                 Message::system(self.system_prompt.clone()),
                 Message::user(prompt),
             ]))
             .await?;
 
-        match response {
-            Message::Assistant { content, .. } if !content.trim().is_empty() => Ok(content),
-            _ => Err(ModelError::NoResponse),
+        if response.message.role == MessageRole::Assistant {
+            let text = response.message.text();
+            if !text.trim().is_empty() {
+                return Ok(text.into_owned());
+            }
         }
+        Err(ModelError::NoResponse)
     }
 }
 

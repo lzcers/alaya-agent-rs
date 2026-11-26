@@ -9,17 +9,17 @@ use crate::{Message, Usage};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenStatistics {
     #[serde(default)]
-    pub prompt_tokens: u64,
+    pub input_tokens: u64,
     #[serde(default)]
-    pub completion_tokens: u64,
+    pub output_tokens: u64,
     #[serde(default)]
     pub total_tokens: u64,
 }
 
 impl TokenStatistics {
     pub fn add_usage(&mut self, usage: &Usage) {
-        self.prompt_tokens += u64::from(usage.prompt_tokens);
-        self.completion_tokens += u64::from(usage.completion_tokens);
+        self.input_tokens += u64::from(usage.input_tokens);
+        self.output_tokens += u64::from(usage.output_tokens);
         self.total_tokens += u64::from(usage.total_tokens);
     }
 }

@@ -1,16 +1,19 @@
 //! OpenAI 兼容协议的 wire 结构体。
 //!
 //! 这里是「线上长什么样」的唯一真相：字段名、别名、容错解析、以及
-//! 域请求 → wire body 的翻译。域层不应该看见本模块的任何类型。
+//! 域请求 ↔ wire body 的双向翻译。域层不应该看见本模块的任何类型。
 
 use serde::de::{self, Unexpected};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::warn;
 
-use crate::MessageRole;
-use crate::capability::ChatRequest;
-use crate::message::{Message, ToolCall, UserContent};
+use crate::capability::{
+    GenerateRequest, ModelError, ReasoningConfig, ResponseFormat, ToolChoice,
+};
+use crate::message::{
+    ContentPart, MediaSource, Message, MessageRole, Modality, ToolCall, mime_to_audio_format,
+};
 
 // ============================================================================
 // 容错反序列化
@@ -96,9 +99,15 @@ pub struct WireChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<WireTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<WireToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<WireResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,19 +120,58 @@ pub struct WireChatRequest {
     pub modalities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<WireAudioConfig>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<Map<String, Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireImageUrl {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireInputAudio {
+    pub data: String,
+    pub format: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireInputFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WireContentPart {
+    Text { text: String },
+    ImageUrl { image_url: WireImageUrl },
+    InputAudio { input_audio: WireInputAudio },
+    File { file: WireInputFile },
+}
+
+/// 纯文本直接序列化为字符串，多模态序列化为 OpenAI content parts 数组。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WireContent {
+    Text(String),
+    Parts(Vec<WireContentPart>),
 }
 
 /// 请求体里的消息。
-///
-/// 与域 [`Message`] 的唯一差别是 `tool_calls` 用 wire 形状——域侧的
-/// [`ToolCall`] 只有 `{id, name, arguments}`，需要在边界上翻译。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role")]
 pub enum WireMessage {
     #[serde(rename = "system")]
     System { content: String },
     #[serde(rename = "user")]
-    User { content: UserContent },
+    User { content: WireContent },
     #[serde(rename = "assistant")]
     Assistant {
         content: String,
@@ -135,71 +183,160 @@ pub enum WireMessage {
     #[serde(rename = "tool")]
     Tool {
         tool_call_id: String,
-        content: String,
+        content: WireContent,
     },
 }
 
-impl From<&Message> for WireMessage {
-    fn from(message: &Message) -> Self {
-        match message {
-            Message::System { content } => Self::System {
-                content: content.clone(),
+fn wire_content_from_parts(parts: &[ContentPart]) -> Result<WireContent, ModelError> {
+    if parts.is_empty() {
+        return Ok(WireContent::Text(String::new()));
+    }
+
+    if parts
+        .iter()
+        .all(|part| matches!(part, ContentPart::Text { .. }))
+    {
+        if let [ContentPart::Text { text }] = parts {
+            return Ok(WireContent::Text(text.clone()));
+        }
+        let joined = parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(WireContent::Text(joined));
+    }
+
+    let mut wire_parts = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            ContentPart::Text { text } => {
+                wire_parts.push(WireContentPart::Text { text: text.clone() });
+            }
+            ContentPart::Image { source, detail } => {
+                wire_parts.push(WireContentPart::ImageUrl {
+                    image_url: WireImageUrl {
+                        url: source.to_uri().into_owned(),
+                        detail: detail.clone(),
+                    },
+                });
+            }
+            ContentPart::Audio { source, .. } => match source {
+                MediaSource::Base64 { media_type, data } => {
+                    wire_parts.push(WireContentPart::InputAudio {
+                        input_audio: WireInputAudio {
+                            data: data.clone(),
+                            format: mime_to_audio_format(media_type).to_string(),
+                        },
+                    });
+                }
+                _ => {
+                    return Err(ModelError::Unsupported(
+                        "OpenAI chat completions only supports inline base64 audio input"
+                            .to_string(),
+                    ));
+                }
             },
-            Message::User { content } => Self::User {
-                content: content.clone(),
-            },
-            Message::Assistant {
-                content,
-                reasoning_content,
-                tool_calls,
-            } => Self::Assistant {
-                content: content.clone(),
-                reasoning_content: reasoning_content.clone(),
-                tool_calls: tool_calls
-                    .as_ref()
-                    .map(|calls| calls.iter().map(WireToolCall::from).collect()),
-            },
-            Message::Tool {
-                tool_call_id,
-                content,
-            } => Self::Tool {
-                tool_call_id: tool_call_id.clone(),
-                content: content.clone(),
-            },
+            ContentPart::File { source, filename } => {
+                let file = match source {
+                    MediaSource::Base64 { .. } => WireInputFile {
+                        filename: filename.clone(),
+                        file_data: Some(source.to_uri().into_owned()),
+                        file_id: None,
+                    },
+                    MediaSource::FileRef { uri, .. } => WireInputFile {
+                        filename: filename.clone(),
+                        file_data: None,
+                        file_id: Some(uri.clone()),
+                    },
+                    MediaSource::Url { .. } => {
+                        return Err(ModelError::Unsupported(
+                            "OpenAI chat completions file input requires base64 data or file_id"
+                                .to_string(),
+                        ));
+                    }
+                };
+                wire_parts.push(WireContentPart::File { file });
+            }
+            ContentPart::Video { .. } => {
+                return Err(ModelError::Unsupported(
+                    "OpenAI chat completions does not support video input parts".to_string(),
+                ));
+            }
+            ContentPart::Reasoning { .. }
+            | ContentPart::ToolCall(_)
+            | ContentPart::ToolResult { .. } => {}
         }
     }
+
+    Ok(WireContent::Parts(wire_parts))
 }
 
-impl From<WireMessage> for Message {
-    fn from(message: WireMessage) -> Self {
-        match message {
-            WireMessage::System { content } => Self::System { content },
-            WireMessage::User { content } => Self::User { content },
-            WireMessage::Assistant {
-                content,
-                reasoning_content,
-                tool_calls,
-            } => Self::Assistant {
-                content,
-                reasoning_content,
-                tool_calls: tool_calls
-                    .map(|calls| calls.into_iter().map(WireToolCall::into_domain).collect()),
-            },
-            WireMessage::Tool {
-                tool_call_id,
-                content,
-            } => Self::Tool {
-                tool_call_id,
-                content,
-            },
+fn wire_messages_from_domain(messages: &[Message]) -> Result<Vec<WireMessage>, ModelError> {
+    let mut out = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        match message.role {
+            MessageRole::System => {
+                out.push(WireMessage::System {
+                    content: message.text().into_owned(),
+                });
+            }
+            MessageRole::User => {
+                out.push(WireMessage::User {
+                    content: wire_content_from_parts(&message.content)?,
+                });
+            }
+            MessageRole::Assistant => {
+                let content = message.text().into_owned();
+                let reasoning_content = message.reasoning();
+                let tool_calls: Vec<WireToolCall> = message
+                    .tool_calls()
+                    .into_iter()
+                    .map(WireToolCall::from)
+                    .collect();
+                out.push(WireMessage::Assistant {
+                    content,
+                    reasoning_content,
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                });
+            }
+            MessageRole::Tool => {
+                let mut emitted = false;
+                for part in &message.content {
+                    if let ContentPart::ToolResult {
+                        tool_call_id,
+                        content,
+                        ..
+                    } = part
+                    {
+                        out.push(WireMessage::Tool {
+                            tool_call_id: tool_call_id.clone(),
+                            content: wire_content_from_parts(content)?,
+                        });
+                        emitted = true;
+                    }
+                }
+                if !emitted {
+                    out.push(WireMessage::Tool {
+                        tool_call_id: String::new(),
+                        content: wire_content_from_parts(&message.content)?,
+                    });
+                }
+            }
         }
     }
+
+    Ok(out)
 }
 
 /// OpenAI 的 tool_calls 元素。
 ///
 /// 流式增量里字段可能只到一部分（后续 chunk 只带 `index` 和参数片段），
-/// 所以除 `id` 外全是 Option；`merge_into` 负责把这些碎片拼成完整项。
+/// 所以除 `id` 外全是 Option；`merge_from` 负责把这些碎片拼成完整项。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireToolCall {
     #[serde(default)]
@@ -270,8 +407,7 @@ impl WireToolCall {
 
     /// wire → 域。
     ///
-    /// 参数在 wire 上是 JSON 文本，解析失败时记录告警并落 [`Value::Null`]——
-    /// 与静默兜底相比，至少让畸形参数可见。
+    /// 参数在 wire 上是 JSON 文本，解析失败时记录告警并落 [`Value::Null`]。
     pub fn into_domain(self) -> ToolCall {
         let (name, raw_arguments) = match &self.function {
             Some(function) => (function.name.clone(), Some(function.arguments.as_str())),
@@ -329,9 +465,33 @@ pub struct WireToolFunction {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct WireResponseFormat {
-    #[serde(rename = "type")]
-    pub response_type: &'static str,
+#[serde(untagged)]
+pub enum WireToolChoice {
+    Mode(&'static str),
+    Function {
+        #[serde(rename = "type")]
+        choice_type: &'static str,
+        function: WireToolChoiceFunction,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WireToolChoiceFunction {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WireResponseFormat {
+    JsonObject,
+    JsonSchema { json_schema: WireJsonSchema },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WireJsonSchema {
+    pub name: String,
+    pub schema: Value,
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -352,69 +512,140 @@ pub struct WireAudioConfig {
     pub voice: Option<String>,
 }
 
-impl WireChatRequest {
-    fn base(model: impl Into<String>, messages: &[Message]) -> Self {
-        Self {
-            model: model.into(),
-            messages: messages.iter().map(WireMessage::from).collect(),
-            stream: None,
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            response_format: None,
-            reasoning_effort: None,
-            thinking: None,
-            stream_options: None,
-            modalities: None,
-            audio: None,
-        }
-    }
-}
-
 /// 域请求 → wire body。所有厂商私有字段的编码都发生在这里。
-impl From<&ChatRequest> for WireChatRequest {
-    fn from(request: &ChatRequest) -> Self {
-        let mut wire = Self::base(request.model.clone(), &request.messages);
+impl TryFrom<&GenerateRequest> for WireChatRequest {
+    type Error = ModelError;
 
-        wire.temperature = request.temperature;
-        wire.max_tokens = request.max_tokens;
+    fn try_from(request: &GenerateRequest) -> Result<Self, Self::Error> {
+        let messages = wire_messages_from_domain(&request.messages)?;
 
-        if let Some(tools) = &request.tools {
-            wire.tools = Some(
-                tools
-                    .iter()
-                    .map(|def| WireTool {
-                        tool_type: "function",
-                        function: WireToolFunction {
-                            name: def.name.clone(),
-                            description: def.description.clone(),
-                            parameters: def.parameters.clone(),
-                        },
-                    })
-                    .collect(),
-            );
+        let tools = request.tools.as_ref().map(|defs| {
+            defs.iter()
+                .map(|def| WireTool {
+                    tool_type: "function",
+                    function: WireToolFunction {
+                        name: def.name.clone(),
+                        description: def.description.clone(),
+                        parameters: def.parameters.clone(),
+                    },
+                })
+                .collect()
+        });
+
+        let tool_choice = request.tool_choice.as_ref().map(|choice| match choice {
+            ToolChoice::Auto => WireToolChoice::Mode("auto"),
+            ToolChoice::None => WireToolChoice::Mode("none"),
+            ToolChoice::Required => WireToolChoice::Mode("required"),
+            ToolChoice::Tool { name } => WireToolChoice::Function {
+                choice_type: "function",
+                function: WireToolChoiceFunction { name: name.clone() },
+            },
+        });
+
+        let response_format = match &request.response_format {
+            ResponseFormat::Text => None,
+            ResponseFormat::JsonObject => Some(WireResponseFormat::JsonObject),
+            ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => Some(WireResponseFormat::JsonSchema {
+                json_schema: WireJsonSchema {
+                    name: name.clone(),
+                    schema: schema.clone(),
+                    strict: *strict,
+                },
+            }),
+        };
+
+        let (reasoning_effort, thinking) = match request.reasoning {
+            ReasoningConfig::Default => (None, None),
+            ReasoningConfig::Disabled => (
+                None,
+                Some(WireThinking {
+                    thinking_type: "disabled",
+                }),
+            ),
+            ReasoningConfig::Enabled | ReasoningConfig::Budget { .. } => (
+                None,
+                Some(WireThinking {
+                    thinking_type: "enabled",
+                }),
+            ),
+            ReasoningConfig::Effort { level } => (Some(level.as_str().to_string()), None),
+        };
+
+        let stream_options = request
+            .include_usage
+            .then_some(WireStreamOptions { include_usage: true });
+
+        let is_plain_text = request.output_modalities.is_empty()
+            || request.output_modalities == [Modality::Text];
+
+        let mut modalities = None;
+        let mut audio = None;
+        if !is_plain_text {
+            let mut wire_modalities = Vec::new();
+            let wants_audio = request.output_modalities.contains(&Modality::Audio);
+            if wants_audio && !request.output_modalities.contains(&Modality::Text) {
+                wire_modalities.push("text".to_string());
+            }
+            for modality in &request.output_modalities {
+                let name = match modality {
+                    Modality::Text => "text",
+                    Modality::Image => "image",
+                    Modality::Audio => "audio",
+                    other => {
+                        return Err(ModelError::Unsupported(format!(
+                            "OpenAI chat completions does not support `{other}` output modality"
+                        )));
+                    }
+                };
+                if !wire_modalities.iter().any(|existing| existing == name) {
+                    wire_modalities.push(name.to_string());
+                }
+            }
+            modalities = Some(wire_modalities);
+
+            if wants_audio {
+                let format = request
+                    .audio_options
+                    .as_ref()
+                    .and_then(|o| o.format.clone())
+                    .unwrap_or_else(|| "wav".to_string());
+                let voice = request.audio_options.as_ref().and_then(|o| o.voice.clone());
+                audio = Some(WireAudioConfig { format, voice });
+            }
         }
 
-        if request.response_format_json {
-            wire.response_format = Some(WireResponseFormat {
-                response_type: "json_object",
-            });
-        }
+        let extra = match &request.provider_options {
+            None => None,
+            Some(Value::Object(map)) => Some(map.clone()),
+            Some(_) => {
+                return Err(ModelError::InvalidRequest(
+                    "provider_options must be a JSON object".to_string(),
+                ));
+            }
+        };
 
-        if request.include_usage {
-            wire.stream_options = Some(WireStreamOptions {
-                include_usage: true,
-            });
-        }
-
-        wire.reasoning_effort = request.reasoning.effort.clone();
-        if let Some(enabled) = request.reasoning.thinking {
-            wire.thinking = Some(WireThinking {
-                thinking_type: if enabled { "enabled" } else { "disabled" },
-            });
-        }
-
-        wire
+        Ok(Self {
+            model: request.model.clone(),
+            messages,
+            stream: None,
+            temperature: request.temperature,
+            top_p: request.top_p,
+            max_tokens: request.max_tokens,
+            stop: request.stop_sequences.clone(),
+            tools,
+            tool_choice,
+            response_format,
+            reasoning_effort,
+            thinking,
+            stream_options,
+            modalities,
+            audio,
+            extra,
+        })
     }
 }
 
@@ -422,8 +653,19 @@ impl From<&ChatRequest> for WireChatRequest {
 // Token 使用统计
 // ============================================================================
 
-/// Token 使用统计
-/// 兼容 OpenAI 和 DeepSeek 的格式（prompt_tokens/input_tokens, completion_tokens/output_tokens）
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WirePromptTokensDetails {
+    #[serde(default, deserialize_with = "deserialize_option_u32_lossy")]
+    pub cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WireCompletionTokensDetails {
+    #[serde(default, deserialize_with = "deserialize_option_u32_lossy")]
+    pub reasoning_tokens: Option<u32>,
+}
+
+/// Token 使用统计：兼容 OpenAI、DeepSeek 与 OpenRouter 字段变体。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireUsage {
     #[serde(alias = "input_tokens")]
@@ -450,6 +692,10 @@ pub struct WireUsage {
         skip_serializing_if = "Option::is_none"
     )]
     pub prompt_cache_miss_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<WirePromptTokensDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<WireCompletionTokensDetails>,
 }
 
 impl WireUsage {
@@ -461,12 +707,25 @@ impl WireUsage {
 
 impl From<WireUsage> for crate::Usage {
     fn from(value: WireUsage) -> Self {
+        let total = value.total();
+        let cache_read_tokens = value.prompt_cache_hit_tokens.or_else(|| {
+            value
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens)
+        });
+        let reasoning_tokens = value
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens);
+
         Self {
-            prompt_tokens: value.prompt_tokens,
-            completion_tokens: value.completion_tokens,
-            total_tokens: value.total(),
-            prompt_cache_hit_tokens: value.prompt_cache_hit_tokens,
-            prompt_cache_miss_tokens: value.prompt_cache_miss_tokens,
+            input_tokens: value.prompt_tokens,
+            output_tokens: value.completion_tokens,
+            total_tokens: total,
+            cache_read_tokens,
+            cache_write_tokens: None,
+            reasoning_tokens,
         }
     }
 }
@@ -493,6 +752,8 @@ pub struct WireChoiceAudio {
     pub data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 /// 选择项中的消息（非流式响应）
@@ -507,6 +768,8 @@ pub struct WireChoiceMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<WireChoiceImg>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<WireChoiceAudio>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<WireToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -515,7 +778,7 @@ pub struct WireChoiceMessage {
 /// 非流式响应的选择项
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireChoice {
-    #[serde(deserialize_with = "deserialize_u32_lossy")]
+    #[serde(default, deserialize_with = "deserialize_u32_lossy")]
     pub index: u32,
     pub message: WireChoiceMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -525,9 +788,13 @@ pub struct WireChoice {
 /// 非流式完整响应
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireResponse {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
     pub choices: Vec<WireChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -551,6 +818,8 @@ pub struct WireDelta {
     #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<WireChoiceImg>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<WireChoiceAudio>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<WireToolCall>>,
@@ -559,8 +828,9 @@ pub struct WireDelta {
 /// 流式响应的选择项
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireStreamChoice {
-    #[serde(deserialize_with = "deserialize_u32_lossy")]
+    #[serde(default, deserialize_with = "deserialize_u32_lossy")]
     pub index: u32,
+    #[serde(default)]
     pub delta: WireDelta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
@@ -568,14 +838,20 @@ pub struct WireStreamChoice {
     pub logprobs: Option<Value>,
 }
 
-/// 流式响应块
+/// 流式响应块（元数据字段宽松默认，兼容各网关的尾部 usage-only 帧）
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireStreamResponse {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub system_fingerprint: Option<String>,
+    #[serde(default)]
     pub choices: Vec<WireStreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<WireUsage>,
@@ -585,6 +861,7 @@ pub struct WireStreamResponse {
 mod tests {
     use super::*;
     use crate::Message;
+    use crate::capability::ReasoningEffort;
     use serde_json::json;
 
     #[test]
@@ -600,7 +877,6 @@ mod tests {
             ..Default::default()
         };
 
-        // 后续 chunk 只带 index 和参数片段。
         let fragment_a = WireToolCall {
             index: Some(0),
             function: Some(WireToolCallFunction {
@@ -810,13 +1086,14 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_maps_domain_fields_to_wire_body() {
-        let request = ChatRequest::new("deepseek-v4-pro", vec![Message::user("hello")])
+    fn generate_request_maps_domain_fields_to_wire_body() {
+        let request = GenerateRequest::new("deepseek-v4-pro", vec![Message::user("hello")])
             .with_temperature(0.25)
             .with_max_tokens(128)
-            .with_response_format_json()
-            .with_reasoning_effort("high")
-            .with_thinking(true)
+            .with_response_format(ResponseFormat::JsonObject)
+            .with_reasoning(ReasoningConfig::Effort {
+                level: ReasoningEffort::High,
+            })
             .with_stream_usage(true)
             .with_tools(Some(vec![crate::message::ToolDef {
                 name: "read_file".to_string(),
@@ -824,14 +1101,13 @@ mod tests {
                 parameters: json!({ "type": "object" }),
             }]));
 
-        let wire = serde_json::to_value(WireChatRequest::from(&request)).unwrap();
+        let wire = serde_json::to_value(WireChatRequest::try_from(&request).unwrap()).unwrap();
 
         assert_eq!(wire["model"], "deepseek-v4-pro");
         assert_eq!(wire["temperature"], 0.25);
         assert_eq!(wire["max_tokens"], 128);
         assert_eq!(wire["response_format"]["type"], "json_object");
         assert_eq!(wire["reasoning_effort"], "high");
-        assert_eq!(wire["thinking"]["type"], "enabled");
         assert_eq!(wire["stream_options"]["include_usage"], true);
         assert_eq!(wire["tools"][0]["type"], "function");
         assert_eq!(wire["tools"][0]["function"]["name"], "read_file");

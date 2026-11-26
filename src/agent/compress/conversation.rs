@@ -1,8 +1,8 @@
 use serde_json::Value;
 
 use super::CompressionError;
-use crate::Message;
 use crate::agent::{Context, Layer, LayerKind};
+use crate::{Message, MessageRole};
 
 pub(super) fn primary_conversation_layer_index(context: &Context) -> Option<usize> {
     context
@@ -57,23 +57,17 @@ pub(super) fn split_by_user_turns(messages: &[Message]) -> (Vec<Message>, Vec<Ve
 }
 
 pub(super) fn is_tool_message(message: &Message) -> bool {
-    matches!(message, Message::Tool { .. })
+    message.role == MessageRole::Tool
 }
 
 pub(super) fn has_reasoning_content(message: &Message) -> bool {
-    matches!(
-        message,
-        Message::Assistant {
-            reasoning_content: Some(reasoning_content),
-            ..
-        } if !reasoning_content.trim().is_empty()
-    )
+    message.role == MessageRole::Assistant && message.has_reasoning()
 }
 
 fn is_system_message(message: &Message) -> bool {
-    matches!(message, Message::System { .. })
+    message.role == MessageRole::System
 }
 
 fn is_user_message(message: &Message) -> bool {
-    matches!(message, Message::User { .. })
+    message.role == MessageRole::User
 }

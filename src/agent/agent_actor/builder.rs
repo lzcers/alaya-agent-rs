@@ -1,31 +1,30 @@
 use super::AgentActor;
 use crate::agent::{Context, ToolExecutor};
-use crate::capability::{ChatCapability, ChatRequest};
+use crate::capability::{GenerateCapability, GenerateRequest};
 
 /// Agent Actor 构建器
-pub struct AgentActorBuilder<C, E>
+pub struct AgentActorBuilder<M, E>
 where
-    C: ChatCapability + Send + Sync + 'static,
+    M: GenerateCapability + Send + Sync + 'static,
     E: ToolExecutor + Send + 'static,
 {
-    chat: C,
-    chat_request: ChatRequest,
+    model: M,
+    request: GenerateRequest,
     tool_executor: E,
     context: Context,
     max_iterations: usize,
     user_id: String,
 }
 
-impl<C, E> AgentActorBuilder<C, E>
+impl<M, E> AgentActorBuilder<M, E>
 where
-    C: ChatCapability + Send + Sync + 'static,
+    M: GenerateCapability + Send + Sync + 'static,
     E: ToolExecutor + Send + 'static,
 {
-    /// 创建新的构建器
-    pub fn new(chat: C, chat_request: ChatRequest, tool_executor: E) -> Self {
+    pub fn new(model: M, request: GenerateRequest, tool_executor: E) -> Self {
         Self {
-            chat,
-            chat_request,
+            model,
+            request,
             tool_executor,
             context: Context::new(),
             max_iterations: 10,
@@ -33,29 +32,25 @@ where
         }
     }
 
-    /// 设置上下文
     pub fn context(mut self, context: Context) -> Self {
         self.context = context;
         self
     }
 
-    /// 设置最大迭代次数
     pub fn max_iterations(mut self, max: usize) -> Self {
         self.max_iterations = max;
         self
     }
 
-    /// 设置用户 ID
     pub fn user_id(mut self, user_id: impl Into<String>) -> Self {
         self.user_id = user_id.into();
         self
     }
 
-    /// 构建 AgentActor
-    pub fn build(self) -> AgentActor<C, E> {
+    pub fn build(self) -> AgentActor<M, E> {
         let mut actor = AgentActor::with_runtime_hooks(
-            self.chat,
-            self.chat_request,
+            self.model,
+            self.request,
             self.tool_executor,
             self.context,
         );

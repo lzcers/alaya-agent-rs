@@ -18,8 +18,8 @@ pub use agent_actor::{
 pub use agent_state::{AgentState, AgentTerminalReason, JobState, Metrics};
 pub use call_model::{CallModelEvent, CallToolResult, call_model, call_tool, call_tools};
 pub use compress::{
-    ChatSummaryModel, CompressionError, ConversationRule, LayerAction, LayerRule, LayerSelector,
-    ModelCompression, RuleCompression, SummaryModel,
+    CompressionError, ConversationRule, GenerateSummaryModel, LayerAction, LayerRule,
+    LayerSelector, ModelCompression, RuleCompression, SummaryModel,
 };
 pub use context::{Context, Layer, LayerKind, LayerMeta};
 pub use filesystem::{FsMemoryStore, FsSelector};

@@ -1,30 +1,47 @@
-//! 分发层：把模型名映射到已注册的能力实现。
+//! 分发层：按逻辑模型名与能力画像把统一生成请求路由到具体协议适配器。
 //!
-//! 这里**不做**任何协议映射——只查表、转发、把「没注册」翻译成
-//! [`ModelError::ModelNotFound`]。协议映射在 [`crate::protocols`]。
+//! - 一张路由表统一承载所有模态（无需按模态拆分多个 `HashMap`）
+//! - 支持逻辑模型名 → 上游模型名映射（解决跨厂商同名冲突与 Azure deployment 映射）
+//! - 调用前按 [`ModelProfile`] 校验输入/输出模态与工具能力
+//! - 同一逻辑名下注册多条路由时，按模态筛选并在遇到可重试错误时顺序切换主备
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 
-use crate::Message;
 use crate::capability::{
-    ChatCapability, ChatChunk, ChatRequest, GenAudioCapability, GenAudioRequest, GenAudioResponse,
-    GenImgCapability, GenImgRequest, GenImgResponse, ModelError,
+    GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream, ModelError, ModelProfile,
 };
+use crate::message::Modality;
 
-/// 按 (能力, 模型名) 分发的路由器。
-///
-/// 能力由**注册时调用的方法**决定，而不是运行时枚举：调用
-/// [`ModelRouter::add_image_model`] 就是在断言「这个模型能生成图片」。
-/// 同一模型名可以在不同能力上指向不同实现。
+/// 一条模型路由目标。
+#[derive(Clone)]
+pub struct ModelRoute {
+    /// 发往上游协议的实际模型名（可与逻辑路由键不同）
+    pub upstream_model: String,
+    pub profile: ModelProfile,
+    pub adapter: Arc<dyn GenerateCapability>,
+}
+
+impl ModelRoute {
+    pub fn new(
+        upstream_model: impl Into<String>,
+        profile: ModelProfile,
+        adapter: Arc<dyn GenerateCapability>,
+    ) -> Self {
+        Self {
+            upstream_model: upstream_model.into(),
+            profile,
+            adapter,
+        }
+    }
+}
+
+/// 统一的多模态模型路由器。
 #[derive(Clone, Default)]
 pub struct ModelRouter {
-    chat: HashMap<String, Arc<dyn ChatCapability>>,
-    image: HashMap<String, Arc<dyn GenImgCapability>>,
-    audio: HashMap<String, Arc<dyn GenAudioCapability>>,
+    routes: HashMap<String, Vec<ModelRoute>>,
 }
 
 impl ModelRouter {
@@ -32,102 +49,140 @@ impl ModelRouter {
         Self::default()
     }
 
-    /// 注册 chat 能力。同名模型已注册时保留原实现。
-    pub fn add_chat_model(&mut self, model: &str, chat: Arc<dyn ChatCapability>) {
-        self.chat.entry(model.to_owned()).or_insert(chat);
+    /// 注册一条路由（逻辑名与上游模型名相同）。
+    pub fn register(
+        &mut self,
+        model: &str,
+        profile: ModelProfile,
+        adapter: Arc<dyn GenerateCapability>,
+    ) {
+        self.register_route(model, ModelRoute::new(model, profile, adapter));
     }
 
-    pub fn add_chat_models(&mut self, models: &[&str], chat: Arc<dyn ChatCapability>) {
+    /// 批量注册共享同一能力画像和适配器的模型。
+    pub fn register_many(
+        &mut self,
+        models: &[&str],
+        profile: ModelProfile,
+        adapter: Arc<dyn GenerateCapability>,
+    ) {
         for model in models {
-            self.add_chat_model(model, chat.clone());
+            self.register(model, profile.clone(), adapter.clone());
         }
     }
 
-    pub fn add_image_model(&mut self, model: &str, image: Arc<dyn GenImgCapability>) {
-        self.image.entry(model.to_owned()).or_insert(image);
+    /// 注册逻辑别名，将 `logical_model` 映射到上游的 `upstream_model`。
+    pub fn register_alias(
+        &mut self,
+        logical_model: &str,
+        upstream_model: &str,
+        profile: ModelProfile,
+        adapter: Arc<dyn GenerateCapability>,
+    ) {
+        self.register_route(
+            logical_model,
+            ModelRoute::new(upstream_model, profile, adapter),
+        );
     }
 
-    pub fn add_image_models(&mut self, models: &[&str], image: Arc<dyn GenImgCapability>) {
-        for model in models {
-            self.add_image_model(model, image.clone());
+    /// 追加一条路由到指定逻辑模型名下（多条兼容路由按注册顺序充当主备）。
+    pub fn register_route(&mut self, logical_model: &str, route: ModelRoute) {
+        self.routes
+            .entry(logical_model.to_owned())
+            .or_default()
+            .push(route);
+    }
+
+    pub fn contains(&self, model: &str) -> bool {
+        self.routes.contains_key(model)
+    }
+
+    pub fn routes(&self, model: &str) -> Option<&[ModelRoute]> {
+        self.routes.get(model).map(Vec::as_slice)
+    }
+
+    pub fn supports_input(&self, model: &str, modality: Modality) -> bool {
+        self.routes.get(model).is_some_and(|list| {
+            list.iter()
+                .any(|route| route.profile.input_modalities.contains(&modality))
+        })
+    }
+
+    pub fn supports_output(&self, model: &str, modality: Modality) -> bool {
+        self.routes.get(model).is_some_and(|list| {
+            list.iter()
+                .any(|route| route.profile.output_modalities.contains(&modality))
+        })
+    }
+
+    fn resolve<'a>(&'a self, request: &GenerateRequest) -> Result<Vec<&'a ModelRoute>, ModelError> {
+        let Some(candidates) = self.routes.get(&request.model) else {
+            return Err(ModelError::ModelNotFound {
+                model: request.model.clone(),
+            });
+        };
+
+        let mut matched = Vec::new();
+        let mut first_mismatch = None;
+
+        for route in candidates {
+            match route.profile.validate(request) {
+                Ok(()) => matched.push(route),
+                Err(err) => {
+                    if first_mismatch.is_none() {
+                        first_mismatch = Some(err);
+                    }
+                }
+            }
         }
-    }
 
-    pub fn add_audio_model(&mut self, model: &str, audio: Arc<dyn GenAudioCapability>) {
-        self.audio.entry(model.to_owned()).or_insert(audio);
-    }
-
-    pub fn add_audio_models(&mut self, models: &[&str], audio: Arc<dyn GenAudioCapability>) {
-        for model in models {
-            self.add_audio_model(model, audio.clone());
+        if matched.is_empty() {
+            return Err(first_mismatch.unwrap_or_else(|| ModelError::ModelNotFound {
+                model: request.model.clone(),
+            }));
         }
-    }
 
-    pub fn supports_chat(&self, model: &str) -> bool {
-        self.chat.contains_key(model)
-    }
-
-    pub fn supports_image(&self, model: &str) -> bool {
-        self.image.contains_key(model)
-    }
-
-    pub fn supports_audio(&self, model: &str) -> bool {
-        self.audio.contains_key(model)
-    }
-
-    fn not_found(model: &str, capability: &'static str) -> ModelError {
-        ModelError::ModelNotFound {
-            model: model.to_owned(),
-            capability,
-        }
+        Ok(matched)
     }
 }
 
 #[async_trait]
-impl ChatCapability for ModelRouter {
-    async fn chat(&self, request: ChatRequest) -> Result<Message, ModelError> {
-        let model = self
-            .chat
-            .get(&request.model)
-            .ok_or_else(|| Self::not_found(&request.model, "chat"))?;
+impl GenerateCapability for ModelRouter {
+    async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
+        let candidates = self.resolve(&request)?;
+        let last_index = candidates.len() - 1;
 
-        model.chat(request).await
+        for (index, route) in candidates.into_iter().enumerate() {
+            let mut upstream_request = request.clone();
+            upstream_request.model = route.upstream_model.clone();
+            match route.adapter.generate(upstream_request).await {
+                Ok(response) => return Ok(response),
+                Err(error) if error.is_retryable() && index < last_index => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!("candidates is non-empty")
     }
 
-    async fn chat_stream(
+    async fn generate_stream(
         &self,
-        request: ChatRequest,
-    ) -> Result<BoxStream<'static, ChatChunk>, ModelError> {
-        let model = self
-            .chat
-            .get(&request.model)
-            .ok_or_else(|| Self::not_found(&request.model, "chat"))?;
+        request: GenerateRequest,
+    ) -> Result<GenerateStream, ModelError> {
+        let candidates = self.resolve(&request)?;
+        let last_index = candidates.len() - 1;
 
-        model.chat_stream(request).await
-    }
-}
+        for (index, route) in candidates.into_iter().enumerate() {
+            let mut upstream_request = request.clone();
+            upstream_request.model = route.upstream_model.clone();
+            match route.adapter.generate_stream(upstream_request).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) if error.is_retryable() && index < last_index => continue,
+                Err(error) => return Err(error),
+            }
+        }
 
-#[async_trait]
-impl GenImgCapability for ModelRouter {
-    async fn gen_img(&self, request: GenImgRequest) -> Result<GenImgResponse, ModelError> {
-        let model = self
-            .image
-            .get(&request.model)
-            .ok_or_else(|| Self::not_found(&request.model, "image"))?;
-
-        model.gen_img(request).await
-    }
-}
-
-#[async_trait]
-impl GenAudioCapability for ModelRouter {
-    async fn gen_audio(&self, request: GenAudioRequest) -> Result<GenAudioResponse, ModelError> {
-        let model = self
-            .audio
-            .get(&request.model)
-            .ok_or_else(|| Self::not_found(&request.model, "audio"))?;
-
-        model.gen_audio(request).await
+        unreachable!("candidates is non-empty")
     }
 }
 
@@ -135,130 +190,137 @@ impl GenAudioCapability for ModelRouter {
 mod tests {
     use super::*;
     use crate::Message;
-    use crate::capability::ChatChunk;
+    use crate::capability::FinishReason;
     use crate::endpoints::{deepseek, openrouter};
+    use crate::message::{ContentPart, MediaSource};
     use futures::stream;
 
-    struct StubChat;
+    struct StubModel {
+        tag: &'static str,
+    }
 
     #[async_trait]
-    impl ChatCapability for StubChat {
-        async fn chat(&self, request: ChatRequest) -> Result<Message, ModelError> {
-            Ok(Message::assistant(format!("chat:{}", request.model)))
+    impl GenerateCapability for StubModel {
+        async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
+            let message = if request.output_modalities.contains(&Modality::Image) {
+                Message::assistant_parts(vec![ContentPart::image(MediaSource::url(format!(
+                    "{}:{}",
+                    self.tag, request.model
+                )))])
+            } else {
+                Message::assistant(format!("{}:{}", self.tag, request.model))
+            };
+            Ok(GenerateResponse {
+                message,
+                finish_reason: Some(FinishReason::Stop),
+                usage: None,
+                model: Some(request.model),
+                id: None,
+            })
         }
 
-        async fn chat_stream(
+        async fn generate_stream(
             &self,
-            _request: ChatRequest,
-        ) -> Result<BoxStream<'static, ChatChunk>, ModelError> {
+            _request: GenerateRequest,
+        ) -> Result<GenerateStream, ModelError> {
             Ok(Box::pin(stream::empty()))
         }
     }
 
-    struct StubAudio;
-
-    #[async_trait]
-    impl GenAudioCapability for StubAudio {
-        async fn gen_audio(
-            &self,
-            _request: GenAudioRequest,
-        ) -> Result<GenAudioResponse, ModelError> {
-            Ok(GenAudioResponse {
-                audio_data: "stub".to_string(),
-                transcript: String::new(),
-                format: "wav".to_string(),
-            })
-        }
-    }
-
-    struct StubImage;
-
-    #[async_trait]
-    impl GenImgCapability for StubImage {
-        async fn gen_img(&self, _request: GenImgRequest) -> Result<GenImgResponse, ModelError> {
-            Ok(GenImgResponse {
-                image_urls: vec!["stub".to_string()],
-            })
-        }
-    }
-
     #[tokio::test]
-    async fn routes_by_model_name_and_capability() {
+    async fn routes_by_model_name_and_modality() {
         let mut router = ModelRouter::new();
-        router.add_chat_model("shared-model", Arc::new(StubChat));
-        router.add_image_model("shared-model", Arc::new(StubImage));
+        router.register(
+            "shared-model",
+            ModelProfile::text(),
+            Arc::new(StubModel { tag: "text" }),
+        );
+        router.register(
+            "shared-model",
+            ModelProfile::image_generation(),
+            Arc::new(StubModel { tag: "image" }),
+        );
 
-        assert!(router.supports_chat("shared-model"));
-        assert!(router.supports_image("shared-model"));
-        assert!(!router.supports_audio("shared-model"));
+        assert!(router.supports_output("shared-model", Modality::Text));
+        assert!(router.supports_output("shared-model", Modality::Image));
+        assert!(!router.supports_output("shared-model", Modality::Audio));
 
-        let message = router
-            .chat(ChatRequest::new("shared-model", vec![Message::user("hi")]))
+        let text_resp = router
+            .generate(GenerateRequest::new(
+                "shared-model",
+                vec![Message::user("hi")],
+            ))
             .await
             .unwrap();
-        assert_eq!(message, Message::assistant("chat:shared-model"));
+        assert_eq!(text_resp.message, Message::assistant("text:shared-model"));
 
-        let image = router
-            .gen_img(GenImgRequest::new("shared-model", "prompt"))
+        let img_resp = router
+            .generate(GenerateRequest::image("shared-model", "prompt"))
             .await
             .unwrap();
-        assert_eq!(image.image_urls, vec!["stub".to_string()]);
+        assert_eq!(
+            img_resp.message.images(),
+            vec![&MediaSource::url("image:shared-model")]
+        );
     }
 
     #[tokio::test]
-    async fn unregistered_model_reports_capability_and_name() {
+    async fn unregistered_model_reports_model_not_found() {
         let router = ModelRouter::new();
 
         let error = router
-            .chat(ChatRequest::new("nope", vec![]))
+            .generate(GenerateRequest::new("nope", vec![]))
             .await
             .expect_err("unregistered model should fail");
 
-        assert!(matches!(
-            error,
-            ModelError::ModelNotFound { model, capability }
-                if model == "nope" && capability == "chat"
-        ));
+        assert!(matches!(error, ModelError::ModelNotFound { model } if model == "nope"));
     }
 
     #[test]
-    fn registration_is_keyed_by_model_and_capability() {
+    fn registration_is_keyed_by_model_and_profile() {
         let mut router = ModelRouter::new();
-        router.add_chat_models(
+        router.register_many(
             &["deepseek-chat", "deepseek-reasoner"],
+            ModelProfile::text(),
             Arc::new(deepseek("dummy_key")),
         );
-        router.add_image_models(
-            &["black-forest-labs/flux.2-klein-4b"],
+        router.register(
+            "black-forest-labs/flux.2-klein-4b",
+            ModelProfile::image_generation(),
             Arc::new(openrouter("dummy_key")),
         );
 
-        assert!(router.supports_chat("deepseek-chat"));
-        assert!(router.supports_chat("deepseek-reasoner"));
-        assert!(!router.supports_chat("black-forest-labs/flux.2-klein-4b"));
-        assert!(router.supports_image("black-forest-labs/flux.2-klein-4b"));
-        assert!(!router.supports_image("deepseek-chat"));
+        assert!(router.supports_output("deepseek-chat", Modality::Text));
+        assert!(router.supports_output("deepseek-reasoner", Modality::Text));
+        assert!(!router.supports_output(
+            "black-forest-labs/flux.2-klein-4b",
+            Modality::Text
+        ));
+        assert!(router.supports_output(
+            "black-forest-labs/flux.2-klein-4b",
+            Modality::Image
+        ));
+        assert!(!router.supports_output("deepseek-chat", Modality::Image));
     }
 
-    #[test]
-    fn every_capability_supports_bulk_registration() {
+    #[tokio::test]
+    async fn alias_rewrites_upstream_model_name() {
         let mut router = ModelRouter::new();
-        router.add_chat_models(&["chat-a", "chat-b"], Arc::new(StubChat));
-        router.add_image_models(&["image-a", "image-b"], Arc::new(StubImage));
-        router.add_audio_models(&["audio-a"], Arc::new(StubAudio));
+        router.register_alias(
+            "fast",
+            "openai/gpt-4o-mini",
+            ModelProfile::vision(),
+            Arc::new(StubModel { tag: "upstream" }),
+        );
 
-        assert!(router.supports_chat("chat-b"));
-        assert!(router.supports_image("image-b"));
-        assert!(router.supports_audio("audio-a"));
-        assert!(!router.supports_audio("audio-b"));
-    }
+        let resp = router
+            .generate(GenerateRequest::new("fast", vec![Message::user("hi")]))
+            .await
+            .unwrap();
 
-    #[test]
-    fn first_registration_wins() {
-        let mut router = ModelRouter::new();
-        router.add_chat_model("m", Arc::new(StubChat));
-        router.add_chat_model("m", Arc::new(StubChat));
-
-        assert_eq!(router.chat.len(), 1);
+        assert_eq!(
+            resp.message,
+            Message::assistant("upstream:openai/gpt-4o-mini")
+        );
     }
 }

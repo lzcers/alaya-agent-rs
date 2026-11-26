@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::AgentActorEvent;
-use crate::Usage;
 use crate::agent::call_model::{
     CallModelEvent, CallToolError, CallToolResult, call_model, call_tools,
 };
@@ -18,15 +17,9 @@ use crate::agent::hooks::metrics::MetricsHook;
 use crate::agent::hooks::send_model_evt::SendModelEvtHook;
 use crate::agent::hooks::update_frame::UpdateFrameHook;
 use crate::agent::{AgentState, ToolCall, ToolExecutor};
-use crate::capability::{ChatCapability, ChatRequest};
+use crate::capability::{FinishReason, GenerateCapability, GenerateRequest};
+use crate::{Message, Usage};
 
-//   - BeforeStep: 扩展 step 级控制。适合做最大迭代检查、预算/配额校验、任务取消判断、加载记忆、恢复 checkpoint、初始化 tracing/span。
-//   - BeforeCallModel: 扩展模型调用前编排。适合做 Prompt 注入、上下文裁剪/压缩、模型路由、动态开关工具、调用前安全策略检查。
-//   - OnModelEvent: 扩展流式模型事件处理。适合做 UI 流式输出、token/耗时统计、增量内容审核、收集 reasoning、拼装 tool call、实时日志。
-//   - AfterCallModel: 扩展模型完成后的收敛处理。适合做结果校验、结构化解析、tool call 合法性检查、重试/降级决策、决定 Done 还是 Continue。
-//   - BeforeCallTools: 扩展工具执行前治理。适合做权限审批、参数修正、工具路由、并发/超时/重试策略、缓存命中、危险工具拦截。
-//   - AfterCallTools: 扩展工具结果后处理。适合做结果标准化、错误映射、脱敏、结果持久化、缓存写回、把工具输出整理成下一轮上下文。
-//   - AfterStep: 扩展 step 提交与收尾。适合做上下文落库、iteration 自增、状态迁移、发送迭代事件、生成审计记录、判断终态。
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub enum LifeCycle {
     BeforeStep,
@@ -50,11 +43,9 @@ pub enum StepExecutionResult {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum LifeCycleInterrupt {
-    // 错误中断
     HookError(LifeCycle, String, String),
     ToolError(String),
     ModelError,
-    // 特殊操作中断
     AskUser { question: String },
 }
 
@@ -87,7 +78,7 @@ impl LifeCycleInterrupt {
 
 pub type LifeCycleFlow = ControlFlow<LifeCycleInterrupt, LifeCycleResult>;
 
-// 生命周期上下文, 给 Hook 使用
+/// 生命周期上下文，给 Hook 使用
 pub struct LifeCycleContext {
     pub stage: LifeCycle,
     pub state: AgentState,
@@ -112,7 +103,7 @@ impl LifeCycleContext {
     pub fn set_model_event(&mut self, model_event: &CallModelEvent) {
         self.model_event = Some(model_event.clone());
     }
-    pub fn set_frame_model_output(&mut self, model_output: ModelOuput) {
+    pub fn set_frame_model_output(&mut self, model_output: ModelOutput) {
         self.frame.set_model_output(model_output);
     }
     pub fn set_frame_tools_result(&mut self, tools_result: Vec<CallToolResult>) {
@@ -142,42 +133,39 @@ impl Default for LifeCycleContext {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModelOuput {
-    pub content: String,
-    pub reasoning_content: Option<String>,
-    pub tools_call: Option<Vec<ToolCall>>,
+pub struct ModelOutput {
+    pub message: Message,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<FinishReason>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StepMetrics {
     pub call_model_duration_ms: Option<u32>,
     pub call_tools_duration_ms: Option<u32>,
 }
 
-impl Default for StepMetrics {
-    fn default() -> Self {
-        Self {
-            call_model_duration_ms: None,
-            call_tools_duration_ms: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StepFrame {
-    pub model_output: Option<ModelOuput>,
+    pub model_output: Option<ModelOutput>,
     pub tools_result: Option<Vec<CallToolResult>>,
     pub token_usage: Option<Usage>,
     pub metrics: StepMetrics,
 }
 
 impl StepFrame {
-    pub fn get_tools_call(&self) -> Option<&Vec<ToolCall>> {
-        self.model_output
-            .as_ref()
-            .and_then(|o| o.tools_call.as_ref())
+    pub fn get_tools_call(&self) -> Option<Vec<ToolCall>> {
+        let calls: Vec<ToolCall> = self
+            .model_output
+            .as_ref()?
+            .message
+            .tool_calls()
+            .into_iter()
+            .cloned()
+            .collect();
+        (!calls.is_empty()).then_some(calls)
     }
-    pub fn set_model_output(&mut self, model_output: ModelOuput) {
+    pub fn set_model_output(&mut self, model_output: ModelOutput) {
         self.model_output = Some(model_output);
     }
     pub fn set_tools_result(&mut self, tools_result: Vec<CallToolResult>) {
@@ -191,17 +179,6 @@ impl StepFrame {
     }
     pub fn set_call_tools_duration_ms(&mut self, duration_ms: u32) {
         self.metrics.call_tools_duration_ms = Some(duration_ms);
-    }
-}
-
-impl Default for StepFrame {
-    fn default() -> Self {
-        Self {
-            model_output: None,
-            tools_result: None,
-            token_usage: None,
-            metrics: Default::default(),
-        }
     }
 }
 
@@ -228,35 +205,30 @@ impl StepLifeCycle {
 
     pub(super) async fn start(
         &mut self,
-        model: &(dyn ChatCapability + Sync),
-        request: &ChatRequest,
+        model: &(dyn GenerateCapability + Sync),
+        request: &GenerateRequest,
         tool_executor: &dyn ToolExecutor,
         event_tx: Option<&mpsc::Sender<AgentActorEvent>>,
     ) -> LifeCycleFlow {
         self.ctx.set_agent_tx(event_tx.cloned());
         let messages = self.ctx.state.get_message();
         let tools = tool_executor.tools().clone();
+        let tools = (!tools.is_empty()).then_some(tools);
 
         self.call_life_cycle_hook(LifeCycle::BeforeStep).await?;
         self.call_life_cycle_hook(LifeCycle::BeforeCallModel)
             .await?;
 
-        let request = request
-            .clone()
-            .with_messages(messages)
-            .with_tools(Some(tools));
+        let request = request.clone().with_messages(messages).with_tools(tools);
         let mut stream = pin!(call_model(model, request));
         while let Some(evt) = stream.next().await {
             self.ctx.set_model_event(&evt);
             self.call_life_cycle_hook(LifeCycle::OnModelEvent).await?;
         }
 
-        // 调用 AfterCallModel 钩子，这里会有 AskUserHook 检测 ask_user 工具
         self.call_life_cycle_hook(LifeCycle::AfterCallModel).await?;
 
-        // 继续执行正常流程
-        if let Some(tools_call) = self.ctx.frame.get_tools_call().cloned() {
-            // 执行工具
+        if let Some(tools_call) = self.ctx.frame.get_tools_call() {
             self.call_life_cycle_hook(LifeCycle::BeforeCallTools)
                 .await?;
 
@@ -273,7 +245,7 @@ impl StepLifeCycle {
                 }
             }
             self.call_life_cycle_hook(LifeCycle::AfterCallTools).await?;
-        };
+        }
 
         self.call_life_cycle_hook(LifeCycle::AfterStep).await?;
 
@@ -296,7 +268,6 @@ impl StepLifeCycle {
         for hook in &mut self.hooks {
             if hook.on(&lifecycle) {
                 let result = hook.handle(&mut self.ctx).await;
-                // 如果是中断（包括错误或 AskUser），立即返回
                 if let LifeCycleFlow::Break(_) = result {
                     return result;
                 }

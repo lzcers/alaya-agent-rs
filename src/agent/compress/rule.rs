@@ -7,8 +7,9 @@ use super::conversation::{
     primary_conversation_layer_index, split_leading_system_messages,
 };
 use super::{CompressionError, ConversationRule, LayerAction, RuleCompression};
-use crate::Message;
 use crate::agent::{Context, Layer, MemoryError, MemoryStore};
+use crate::message::render_display_text;
+use crate::{ContentPart, Message, MessageRole};
 
 const TOOL_RESULT_CLEARED: &str = "[Tool result cleared]";
 const REASONING_CLEARED: &str = "[Reasoning cleared]";
@@ -121,63 +122,68 @@ fn compress_conversation_messages(
     let mut compressed = system_prefix;
     let mut cleared_tool_count = 0usize;
 
-    for (index, message) in retained_messages.into_iter().enumerate() {
-        match message {
-            Message::Tool {
-                tool_call_id,
-                content,
-            } => {
+    for (index, mut message) in retained_messages.into_iter().enumerate() {
+        match message.role {
+            MessageRole::Tool => {
                 if keep_tool_indices.contains(&index) {
-                    compressed.push(Message::Tool {
-                        tool_call_id,
-                        content,
-                    });
+                    compressed.push(message);
                     continue;
                 }
 
-                cleared_tool_count += 1;
-                let placeholder = if let Some(store) = memory.as_deref_mut() {
-                    let archive_path =
-                        archive_tool_result(store, cleared_tool_count, &tool_call_id, &content)?;
-                    format!("[Tool result cleared. Use memory_read('{archive_path}') to retrieve.]")
-                } else {
-                    TOOL_RESULT_CLEARED.to_string()
-                };
-
-                compressed.push(Message::Tool {
-                    tool_call_id,
-                    content: placeholder,
-                });
+                let mut replaced = Vec::with_capacity(message.content.len());
+                for part in message.content {
+                    match part {
+                        ContentPart::ToolResult {
+                            tool_call_id,
+                            content,
+                            is_error,
+                        } => {
+                            cleared_tool_count += 1;
+                            let archived_text = render_display_text(&content);
+                            let placeholder = if let Some(store) = memory.as_deref_mut() {
+                                let archive_path = archive_tool_result(
+                                    store,
+                                    cleared_tool_count,
+                                    &tool_call_id,
+                                    &archived_text,
+                                )?;
+                                format!(
+                                    "[Tool result cleared. Use memory_read('{archive_path}') to retrieve.]"
+                                )
+                            } else {
+                                TOOL_RESULT_CLEARED.to_string()
+                            };
+                            replaced.push(ContentPart::ToolResult {
+                                tool_call_id,
+                                content: vec![ContentPart::text(placeholder)],
+                                is_error,
+                            });
+                        }
+                        other => replaced.push(other),
+                    }
+                }
+                message.content = replaced;
+                compressed.push(message);
             }
-            Message::Assistant {
-                content,
-                reasoning_content,
-                tool_calls,
-            } => {
+            MessageRole::Assistant => {
                 if rule.clear_reasoning
-                    && reasoning_content
-                        .as_deref()
-                        .is_some_and(|text| !text.trim().is_empty())
+                    && message.has_reasoning()
                     && !keep_reasoning_indices.contains(&index)
                 {
-                    compressed.push(Message::Assistant {
-                        content: if content.trim().is_empty() {
-                            REASONING_CLEARED.to_string()
-                        } else {
-                            content
-                        },
-                        reasoning_content: None,
-                        tool_calls,
-                    });
-                } else {
-                    compressed.push(Message::Assistant {
-                        content,
-                        reasoning_content,
-                        tool_calls,
-                    });
+                    message
+                        .content
+                        .retain(|part| !matches!(part, ContentPart::Reasoning { .. }));
+                    let has_visible_content = message
+                        .content
+                        .iter()
+                        .any(|part| !matches!(part, ContentPart::ToolCall(_)) && !part.is_empty());
+                    if !has_visible_content {
+                        message.content.insert(0, ContentPart::text(REASONING_CLEARED));
+                    }
                 }
+                compressed.push(message);
             }
-            other => compressed.push(other),
+            _ => compressed.push(message),
         }
     }
 

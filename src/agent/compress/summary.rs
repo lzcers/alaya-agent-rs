@@ -4,8 +4,9 @@ use super::conversation::{
     conversation_messages, primary_conversation_layer_index, split_by_user_turns,
 };
 use super::{CompressionError, ModelCompression, SummaryModel};
-use crate::Message;
 use crate::agent::{Context, Layer, LayerKind};
+use crate::message::render_display_text;
+use crate::{ContentPart, Message, MessageRole};
 
 const DEFAULT_SUMMARIZE_INSTRUCTION: &str = "Preserve key decisions, constraints, pending work, and unresolved questions. Discard repetitive exploration and raw tool output unless it changes the state of the task.";
 const DEFAULT_SUMMARY_LAYER_TAG: &str = "compressed_summary";
@@ -94,53 +95,61 @@ fn build_summary_prompt(
 }
 
 fn transcript_lines(message: &Message) -> Vec<String> {
-    match message {
-        Message::System { content } => {
-            if content.trim().is_empty() {
+    match message.role {
+        MessageRole::System => {
+            let text = message.display_text();
+            if text.trim().is_empty() {
                 Vec::new()
             } else {
-                vec![format!("system: {content}")]
+                vec![format!("system: {text}")]
             }
         }
-        Message::User { content } => {
-            let text = content.to_display_text();
+        MessageRole::User => {
+            let text = message.display_text();
             if text.trim().is_empty() {
                 Vec::new()
             } else {
                 vec![format!("user: {text}")]
             }
         }
-        Message::Assistant {
-            content,
-            tool_calls,
-            ..
-        } => {
+        MessageRole::Assistant => {
             let mut lines = Vec::new();
-            if !content.trim().is_empty() {
-                lines.push(format!("assistant: {content}"));
+            let text = message.display_text();
+            if !text.trim().is_empty() {
+                lines.push(format!("assistant: {text}"));
             }
-            if let Some(tool_calls) = tool_calls {
-                for call in tool_calls {
-                    let name = call.name.clone();
-                    if name.is_empty() {
-                        continue;
-                    }
-                    lines.push(format!("assistant_tool_call: {} {}", name, call.arguments));
+            for call in message.tool_calls() {
+                if call.name.is_empty() {
+                    continue;
                 }
+                lines.push(format!(
+                    "assistant_tool_call: {} {}",
+                    call.name, call.arguments
+                ));
             }
             lines
         }
-        Message::Tool {
-            tool_call_id,
-            content,
-        } => {
-            if content.trim().is_empty() {
-                Vec::new()
-            } else if tool_call_id.trim().is_empty() {
-                vec![format!("tool: {content}")]
-            } else {
-                vec![format!("tool[{tool_call_id}]: {content}")]
+        MessageRole::Tool => {
+            let mut lines = Vec::new();
+            for part in &message.content {
+                if let ContentPart::ToolResult {
+                    tool_call_id,
+                    content,
+                    ..
+                } = part
+                {
+                    let text = render_display_text(content);
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    if tool_call_id.trim().is_empty() {
+                        lines.push(format!("tool: {text}"));
+                    } else {
+                        lines.push(format!("tool[{tool_call_id}]: {text}"));
+                    }
+                }
             }
+            lines
         }
     }
 }

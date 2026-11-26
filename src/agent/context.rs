@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::Message;
+use crate::{Message, MessageRole};
 
 /// 通用上下文 - 分层、类型化、可演化的数据容器
 ///
@@ -245,7 +245,7 @@ impl Context {
         let rollback_index = arr.iter().rposition(|item| {
             matches!(
                 serde_json::from_value::<Message>(item.clone()),
-                Ok(Message::User { .. })
+                Ok(message) if message.role == MessageRole::User
             )
         });
 
@@ -349,12 +349,13 @@ fn layer_to_user_content(layer: &Layer) -> Option<String> {
 }
 
 fn format_message_as_text(message: &Message) -> String {
-    match message {
-        Message::System { content } => format!("system: \n{}", content),
-        Message::User { content } => format!("user: \n{}", content.to_display_text()),
-        Message::Assistant { content, .. } => format!("assistant: \n{}", content),
-        Message::Tool { content, .. } => format!("tool: \n{}", content),
-    }
+    let label = match message.role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    };
+    format!("{label}: \n{}", message.display_text())
 }
 
 impl Layer {
@@ -436,15 +437,13 @@ mod tests {
             .layer(Layer::new(
                 "conversation",
                 LayerKind::Conversation,
-                serde_json::json!([
-                    {"role": "user", "content": "Hello"},
-                    {"role": "assistant", "content": "Hi!"}
-                ]),
+                serde_json::to_value(vec![Message::user("Hello"), Message::assistant("Hi!")])
+                    .unwrap(),
             ));
 
         let messages = ctx.to_messages();
         assert_eq!(messages.len(), 3); // system + 2 conversation
-        assert!(matches!(messages[0], Message::System { .. }));
+        assert_eq!(messages[0].role, MessageRole::System);
     }
 
     #[test]
@@ -477,11 +476,11 @@ mod tests {
 
         let messages = ctx.to_messages();
         assert_eq!(messages.len(), 3);
-        assert!(matches!(messages[0], Message::System { .. }));
-        assert!(matches!(messages[1], Message::User { .. }));
-        assert!(matches!(messages[2], Message::User { .. }));
-        assert_eq!(messages[1].content(), "世界历史摘要\n王国陷入内战。");
-        assert_eq!(messages[2].content(), "当前状态\n位置：王都广场");
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(messages[1].role, MessageRole::User);
+        assert_eq!(messages[2].role, MessageRole::User);
+        assert_eq!(messages[1].text(), "世界历史摘要\n王国陷入内战。");
+        assert_eq!(messages[2].text(), "当前状态\n位置：王都广场");
     }
 
     #[test]
@@ -499,22 +498,23 @@ mod tests {
         let mut ctx = Context::new().layer(Layer::new(
             "conversation",
             LayerKind::Conversation,
-            serde_json::json!([
-                {"role": "user", "content": "turn 1"},
-                {"role": "assistant", "content": "answer 1"},
-                {"role": "user", "content": "turn 2"},
-                {"role": "assistant", "content": "", "tool_calls": []},
-                {"role": "tool", "tool_call_id": "call_1", "content": "tool result"},
-                {"role": "assistant", "content": "answer 2"}
-            ]),
+            serde_json::to_value(vec![
+                Message::user("turn 1"),
+                Message::assistant("answer 1"),
+                Message::user("turn 2"),
+                Message::assistant(""),
+                Message::tool_result("call_1", "tool result"),
+                Message::assistant("answer 2"),
+            ])
+            .unwrap(),
         ));
 
         assert!(ctx.rollback_latest_input());
 
         let conv = ctx.conversation();
         assert_eq!(conv.len(), 2);
-        assert_eq!(conv[0].content(), "turn 1");
-        assert_eq!(conv[1].content(), "answer 1");
+        assert_eq!(conv[0].text(), "turn 1");
+        assert_eq!(conv[1].text(), "answer 1");
     }
 
     #[test]
@@ -522,19 +522,20 @@ mod tests {
         let mut ctx = Context::new().layer(Layer::new(
             "conversation",
             LayerKind::Conversation,
-            serde_json::json!([
-                {"role": "user", "content": "turn 1"},
-                {"role": "assistant", "content": "answer 1"},
-                {"role": "user", "content": "pending input"}
-            ]),
+            serde_json::to_value(vec![
+                Message::user("turn 1"),
+                Message::assistant("answer 1"),
+                Message::user("pending input"),
+            ])
+            .unwrap(),
         ));
 
         assert!(ctx.rollback_latest_input());
 
         let conv = ctx.conversation();
         assert_eq!(conv.len(), 2);
-        assert_eq!(conv[0].content(), "turn 1");
-        assert_eq!(conv[1].content(), "answer 1");
+        assert_eq!(conv[0].text(), "turn 1");
+        assert_eq!(conv[1].text(), "answer 1");
     }
 
     #[test]
@@ -542,9 +543,7 @@ mod tests {
         let mut ctx = Context::new().layer(Layer::new(
             "conversation",
             LayerKind::Conversation,
-            serde_json::json!([
-                {"role": "assistant", "content": "answer only"}
-            ]),
+            serde_json::to_value(vec![Message::assistant("answer only")]).unwrap(),
         ));
 
         assert!(!ctx.rollback_latest_input());
@@ -562,15 +561,13 @@ mod tests {
             .layer(Layer::new(
                 "conversation",
                 LayerKind::Conversation,
-                serde_json::json!([
-                    {"role": "user", "content": "Hello"},
-                    {"role": "assistant", "content": "Hi!"}
-                ]),
+                serde_json::to_value(vec![Message::user("Hello"), Message::assistant("Hi!")])
+                    .unwrap(),
             ));
 
         assert_eq!(
             ctx.print(),
-            "system: Be helpful.\nuser: Hello\nassistant: Hi!"
+            "system: \nBe helpful.\nuser: \nHello\nassistant: \nHi!"
         );
     }
 
@@ -579,12 +576,10 @@ mod tests {
         let ctx = Context::new().layer(Layer::new(
             "conversation",
             LayerKind::Conversation,
-            serde_json::json!([
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": "Hi!"}
-            ]),
+            serde_json::to_value(vec![Message::user("Hello"), Message::assistant("Hi!")])
+                .unwrap(),
         ));
 
-        assert_eq!(ctx.print_latest_msg().as_deref(), Some("assistant: Hi!"));
+        assert_eq!(ctx.print_latest_msg().as_deref(), Some("assistant: \nHi!"));
     }
 }

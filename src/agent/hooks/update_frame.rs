@@ -1,5 +1,5 @@
 use crate::agent::{
-    agent_actor::lifecycle::{LifeCycle, LifeCycleFlow, LifeCycleResult, ModelOuput},
+    agent_actor::lifecycle::{LifeCycle, LifeCycleFlow, LifeCycleResult, ModelOutput},
     call_model::CallModelEvent,
     hooks::{HookName, LifeCycleContext, LifeCycleHook},
 };
@@ -25,19 +25,17 @@ impl LifeCycleHook for UpdateFrameHook {
     }
     async fn handle(&mut self, ctx: &mut LifeCycleContext) -> LifeCycleFlow {
         if let Some(CallModelEvent::Completed {
-            content,
-            reasoning_content,
-            tools_call,
+            message,
             usage,
+            finish_reason,
         }) = ctx.model_event.as_ref()
         {
-            let output = ModelOuput {
-                content: content.to_owned(),
-                reasoning_content: reasoning_content.to_owned(),
-                tools_call: tools_call.to_owned(),
+            let output = ModelOutput {
+                message: message.clone(),
+                finish_reason: finish_reason.clone(),
             };
             if let Some(usage) = usage {
-                ctx.set_frame_token_usage(usage.clone());
+                ctx.set_frame_token_usage(*usage);
             }
             ctx.set_frame_model_output(output);
         }

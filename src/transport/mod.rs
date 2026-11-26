@@ -18,3 +18,4 @@ pub mod sse;
 pub use error::TransportError;
 pub use http::{HttpTransport, Transport};
 pub use request::{BodyStream, HttpRequest, HttpResponse};
+pub use sse::SseEvent;

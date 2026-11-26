@@ -4,12 +4,15 @@ use crate::agent::{
     Tool, ToolCall, ToolDef, ToolExecutorError,
 };
 
-use crate::capability::{ChatCapability, ChatChunk, ChatRequest, ModelError};
+use crate::capability::{
+    FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream,
+    ModelError, ModelProfile, PartDelta, StreamEvent,
+};
 use crate::endpoints::deepseek_from_env;
 use crate::router::ModelRouter;
-use crate::{Message, Usage};
+use crate::{ContentPart, Message, Usage};
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream};
+use futures::stream;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -63,15 +66,16 @@ fn print_tool_result(call_id: &str, success: bool, output: &str) {
     print_field("output", preview_text(output, 220));
 }
 
-fn print_step_snapshot(content: &str, reasoning_content: Option<&str>, tool_call_count: usize) {
+fn print_step_snapshot(message: &Message) {
     print_section("Step Completed");
-    if !content.is_empty() {
-        print_field("content", preview_text(content, 220));
+    let text = message.text();
+    if !text.is_empty() {
+        print_field("content", preview_text(&text, 220));
     }
-    if let Some(reasoning) = reasoning_content.filter(|text| !text.is_empty()) {
-        print_field("reasoning", preview_text(reasoning, 220));
+    if let Some(reasoning) = message.reasoning().filter(|text| !text.is_empty()) {
+        print_field("reasoning", preview_text(&reasoning, 220));
     }
-    print_field("tool_calls", tool_call_count);
+    print_field("tool_calls", message.tool_calls().len());
 }
 
 fn print_step_finalized(step_index: usize, result: &StepResult, frame: &impl std::fmt::Debug) {
@@ -85,21 +89,23 @@ fn print_step_finalized(step_index: usize, result: &StepResult, frame: &impl std
     print_field("frame", preview_text(&format!("{:?}", frame), 220));
 }
 
-struct MockChatModel {
-    chunks: Vec<ChatChunk>,
+struct MockModel {
+    events: Vec<StreamEvent>,
 }
 
 #[async_trait]
-impl ChatCapability for MockChatModel {
-    async fn chat(&self, _request: ChatRequest) -> Result<Message, ModelError> {
-        panic!("chat should not be called in this test");
+impl GenerateCapability for MockModel {
+    async fn generate(&self, _request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
+        panic!("generate should not be called in this test");
     }
 
-    async fn chat_stream(
+    async fn generate_stream(
         &self,
-        _request: ChatRequest,
-    ) -> Result<BoxStream<'static, ChatChunk>, ModelError> {
-        Ok(Box::pin(stream::iter(self.chunks.clone())))
+        _request: GenerateRequest,
+    ) -> Result<GenerateStream, ModelError> {
+        let items: Vec<Result<StreamEvent, ModelError>> =
+            self.events.iter().cloned().map(Ok).collect();
+        Ok(Box::pin(stream::iter(items)))
     }
 }
 
@@ -136,18 +142,12 @@ impl Tool for EchoTool {
     }
 }
 
-/// 此测试需要设置 DEEPSEEK_API_KEY 环境变量
-///
-/// 注意：由于真实 LLM 行为不可预测，此测试主要验证：
-/// 1. playwright_cli 工具能够被正确注册和调用
-/// 2. Agent 能够完成执行（Completed 或 MaxIterations）
 #[tokio::test]
 async fn test_agent_actor_with_deepseek_and_playwright() {
     dotenv::dotenv().ok();
 
     print_test_banner("AgentActor DeepSeek + Playwright Test");
 
-    // 1. 创建 DeepSeek Provider
     let provider = match deepseek_from_env() {
         Ok(p) => Arc::new(p),
         Err(_) => {
@@ -157,15 +157,16 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
         }
     };
 
-    // 2. 创建 ModelRouter
     let mut model = ModelRouter::new();
-    model.add_chat_model("deepseek-reasoner", provider);
+    model.register(
+        "deepseek-reasoner",
+        ModelProfile::text().with_reasoning(true),
+        provider,
+    );
 
-    // 3. 创建工具执行器并注册真实的 Playwright 工具
     let mut executor = GenericToolExecutor::new();
     executor.register(PlaywrightCliTool::new());
 
-    // 4. 创建上下文 - 使用更明确的提示引导模型使用工具
     let mut context = Context::new();
     context.add_message(Message::system(
         r#"你是一个聪明的助手，当用户需要访问网页或提取网页内容时, 你可以使用工具完成任务。"#,
@@ -180,30 +181,25 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
         "请帮我总结 https://www.peopleapp.com/column/30051629695-500007391518 网页的内容",
     );
 
-    // 5. 创建 AgentActo
     let actor = AgentActor::new(
         model,
-        ChatRequest::new("deepseek-reasoner", Vec::new()),
+        GenerateRequest::new("deepseek-reasoner", Vec::new()),
         executor,
         context,
     );
 
-    // 6. 启动 Actor
     let mut handle = actor.run_loop();
 
-    // 7. 收集事件
     let mut events: Vec<AgentActorEvent> = Vec::new();
     let mut tool_calls_log: Vec<String> = Vec::new();
     let mut step_index = 0usize;
 
     while let Some(event) = handle.event_rx.recv().await {
         match &event {
-            AgentActorEvent::ContentChunk(_) => {
-                // print!("{}", content);
-            }
-            AgentActorEvent::ReasoningChunk(_) => {
-                // print!("{}", content);
-            }
+            AgentActorEvent::ContentChunk(_)
+            | AgentActorEvent::ReasoningChunk(_)
+            | AgentActorEvent::AudioChunk { .. }
+            | AgentActorEvent::PartCompleted(_) => {}
             AgentActorEvent::ToolCalls(calls) => {
                 print_section(&format!("Tool Calls ({})", calls.len()));
                 for (index, call) in calls.iter().enumerate() {
@@ -218,13 +214,8 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
             } => {
                 print_tool_result(call_id, *success, output);
             }
-            AgentActorEvent::StepCompleted {
-                content,
-                reasoning_content,
-                tool_calls,
-            } => {
-                let tool_call_count = tool_calls.as_ref().map_or(0, Vec::len);
-                print_step_snapshot(content, reasoning_content.as_deref(), tool_call_count);
+            AgentActorEvent::StepCompleted { message } => {
+                print_step_snapshot(message);
             }
             AgentActorEvent::StepFinalized { result, frame } => {
                 step_index += 1;
@@ -266,7 +257,7 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
                 print_field("status", "max_iterations");
                 print_field("iteration", iteration.to_string());
             }
-            AgentActorEvent::AskUser { question, input_id } => {
+            AgentActorEvent::AskUser { .. } => {
                 todo!();
             }
         }
@@ -342,7 +333,6 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
     }
     print_field("terminal", terminal_status);
 
-    // 验证执行结束（Completed 或 MaxIterations 都算成功）
     let finished = events.iter().any(|e| {
         matches!(
             e,
@@ -354,21 +344,21 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
 
 #[tokio::test]
 async fn test_agent_actor_accumulates_usage_from_stream_response() {
-    let model = MockChatModel {
-        chunks: vec![ChatChunk {
-            content: "done".to_string(),
-            reasoning_content: String::new(),
-            is_finished: true,
-            finish_reason: Some("stop".to_string()),
-            tool_calls: None,
-            usage: Some(Usage {
-                prompt_tokens: 13,
-                completion_tokens: 8,
-                total_tokens: 21,
-                prompt_cache_hit_tokens: None,
-                prompt_cache_miss_tokens: None,
+    let model = MockModel {
+        events: vec![
+            StreamEvent::Delta(PartDelta::Text {
+                text: "done".to_string(),
             }),
-        }],
+            StreamEvent::Finished {
+                reason: Some(FinishReason::Stop),
+            },
+            StreamEvent::Usage(Usage {
+                input_tokens: 13,
+                output_tokens: 8,
+                total_tokens: 21,
+                ..Usage::default()
+            }),
+        ],
     };
 
     let executor = GenericToolExecutor::new();
@@ -377,15 +367,15 @@ async fn test_agent_actor_accumulates_usage_from_stream_response() {
 
     let mut actor = AgentActor::new(
         model,
-        ChatRequest::new("mock-model", Vec::new()),
+        GenerateRequest::new("mock-model", Vec::new()),
         executor,
         context,
     );
     let result = actor.run_step(None).await;
 
     assert!(matches!(result, crate::agent::StepResult::Done { .. }));
-    assert_eq!(actor.state().metrics.tokens.prompt_tokens, 13);
-    assert_eq!(actor.state().metrics.tokens.completion_tokens, 8);
+    assert_eq!(actor.state().metrics.tokens.input_tokens, 13);
+    assert_eq!(actor.state().metrics.tokens.output_tokens, 8);
     assert_eq!(actor.state().metrics.tokens.total_tokens, 21);
     assert_eq!(actor.state().metrics.execution.iteration, 1);
     assert_eq!(
@@ -399,19 +389,20 @@ async fn test_agent_actor_accumulates_usage_from_stream_response() {
 
 #[tokio::test]
 async fn test_agent_actor_emits_step_frame_metrics_to_upper_layer() {
-    let model = MockChatModel {
-        chunks: vec![ChatChunk {
-            content: "use tool".to_string(),
-            reasoning_content: String::new(),
-            is_finished: true,
-            finish_reason: Some("tool_calls".to_string()),
-            tool_calls: Some(vec![ToolCall {
+    let model = MockModel {
+        events: vec![
+            StreamEvent::Delta(PartDelta::Text {
+                text: "use tool".to_string(),
+            }),
+            StreamEvent::Part(ContentPart::ToolCall(ToolCall {
                 id: "call_1".to_string(),
                 name: "echo".to_string(),
                 arguments: json!({ "value": "ok" }),
-            }]),
-            usage: None,
-        }],
+            })),
+            StreamEvent::Finished {
+                reason: Some(FinishReason::ToolCalls),
+            },
+        ],
     };
 
     let mut executor = GenericToolExecutor::new();
@@ -422,7 +413,7 @@ async fn test_agent_actor_emits_step_frame_metrics_to_upper_layer() {
 
     let mut actor = AgentActor::new(
         model,
-        ChatRequest::new("mock-model", Vec::new()),
+        GenerateRequest::new("mock-model", Vec::new()),
         executor,
         context,
     );
@@ -454,15 +445,15 @@ async fn test_agent_actor_emits_step_frame_metrics_to_upper_layer() {
 
 #[tokio::test]
 async fn test_agent_actor_records_error_metrics_when_max_iterations_exceeded() {
-    let model = MockChatModel {
-        chunks: vec![ChatChunk {
-            content: "done".to_string(),
-            reasoning_content: String::new(),
-            is_finished: true,
-            finish_reason: Some("stop".to_string()),
-            tool_calls: None,
-            usage: None,
-        }],
+    let model = MockModel {
+        events: vec![
+            StreamEvent::Delta(PartDelta::Text {
+                text: "done".to_string(),
+            }),
+            StreamEvent::Finished {
+                reason: Some(FinishReason::Stop),
+            },
+        ],
     };
 
     let executor = GenericToolExecutor::new();
@@ -471,7 +462,7 @@ async fn test_agent_actor_records_error_metrics_when_max_iterations_exceeded() {
 
     let mut actor = AgentActor::new(
         model,
-        ChatRequest::new("mock-model", Vec::new()),
+        GenerateRequest::new("mock-model", Vec::new()),
         executor,
         context,
     );

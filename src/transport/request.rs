@@ -52,6 +52,16 @@ impl HttpRequest {
         Ok(self)
     }
 
+    /// 追加一个 query 参数（兼容 URL 已有 `?` 的场景）。
+    pub fn with_query(mut self, key: &str, value: impl AsRef<str>) -> Self {
+        let sep = if self.url.contains('?') { '&' } else { '?' };
+        self.url.push(sep);
+        self.url.push_str(key);
+        self.url.push('=');
+        self.url.push_str(value.as_ref());
+        self
+    }
+
     /// 用 JSON 作为请求体，并带上 `Content-Type`。
     pub fn with_json_body<T: Serialize + ?Sized>(
         mut self,

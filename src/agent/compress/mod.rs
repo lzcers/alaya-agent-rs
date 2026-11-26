@@ -7,8 +7,8 @@ use crate::agent::Context;
 use crate::agent::MemoryStore;
 
 pub use types::{
-    ChatSummaryModel, CompressionError, ConversationRule, LayerAction, LayerRule, LayerSelector,
-    ModelCompression, RuleCompression, SummaryModel,
+    CompressionError, ConversationRule, GenerateSummaryModel, LayerAction, LayerRule,
+    LayerSelector, ModelCompression, RuleCompression, SummaryModel,
 };
 
 impl Context {

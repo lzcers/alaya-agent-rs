@@ -1,52 +1,45 @@
 use async_trait::async_trait;
+use futures::stream;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-use crate::Message;
 use crate::agent::compress::{
-    ChatSummaryModel, ConversationRule, LayerAction, LayerRule, LayerSelector, ModelCompression,
-    RuleCompression, SummaryModel,
+    ConversationRule, GenerateSummaryModel, LayerAction, LayerRule, LayerSelector,
+    ModelCompression, RuleCompression, SummaryModel,
 };
 use crate::agent::{Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall};
-use crate::capability::{ChatCapability, ChatChunk, ChatRequest, ModelError};
-use futures::stream::{self, BoxStream};
+use crate::capability::{
+    FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream, ModelError,
+};
+use crate::{ContentPart, Message, MessageRole};
 
 fn conversation_with_tools_and_reasoning() -> Vec<Message> {
     vec![
         Message::system("Conversation system"),
         Message::user("Open the config"),
-        Message::Assistant {
-            content: String::new(),
-            reasoning_content: Some("Need to inspect the config first".to_string()),
-            tool_calls: Some(vec![ToolCall {
+        Message::assistant_parts(vec![
+            ContentPart::reasoning("Need to inspect the config first"),
+            ContentPart::tool_call(ToolCall {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 arguments: json!({ "path": "config.json" }),
-            }]),
-        },
-        Message::Tool {
-            tool_call_id: "call_1".to_string(),
-            content: "{\"debug\":true}".to_string(),
-        },
-        Message::Assistant {
-            content: "Config loaded".to_string(),
-            reasoning_content: Some("Debug mode is enabled".to_string()),
-            tool_calls: None,
-        },
+            }),
+        ]),
+        Message::tool_result("call_1", "{\"debug\":true}"),
+        Message::assistant_parts(vec![
+            ContentPart::reasoning("Debug mode is enabled"),
+            ContentPart::text("Config loaded"),
+        ]),
         Message::user("Search handlers"),
-        Message::Assistant {
-            content: String::new(),
-            reasoning_content: Some("Need grep across the repository".to_string()),
-            tool_calls: Some(vec![ToolCall {
+        Message::assistant_parts(vec![
+            ContentPart::reasoning("Need grep across the repository"),
+            ContentPart::tool_call(ToolCall {
                 id: "call_2".to_string(),
                 name: "file_search".to_string(),
                 arguments: json!({ "pattern": "handler" }),
-            }]),
-        },
-        Message::Tool {
-            tool_call_id: "call_2".to_string(),
-            content: "{\"matches\":[\"src/main.rs:12\"]}".to_string(),
-        },
+            }),
+        ]),
+        Message::tool_result("call_2", "{\"matches\":[\"src/main.rs:12\"]}"),
         Message::assistant("Found one handler"),
     ]
 }
@@ -93,25 +86,40 @@ impl SummaryModel for StubSummaryModel {
     }
 }
 
-struct StubChatModel {
+struct StubGenerateModel {
     response: Message,
 }
 
 #[async_trait]
-impl ChatCapability for StubChatModel {
-    async fn chat(&self, request: ChatRequest) -> Result<Message, ModelError> {
+impl GenerateCapability for StubGenerateModel {
+    async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
         assert_eq!(request.messages.len(), 2);
-        assert!(matches!(request.messages[0], Message::System { .. }));
-        assert!(matches!(request.messages[1], Message::User { .. }));
-        Ok(self.response.clone())
+        assert_eq!(request.messages[0].role, MessageRole::System);
+        assert_eq!(request.messages[1].role, MessageRole::User);
+        Ok(GenerateResponse {
+            message: self.response.clone(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+            model: Some(request.model),
+            id: None,
+        })
     }
 
-    async fn chat_stream(
+    async fn generate_stream(
         &self,
-        _request: ChatRequest,
-    ) -> Result<BoxStream<'static, ChatChunk>, ModelError> {
+        _request: GenerateRequest,
+    ) -> Result<GenerateStream, ModelError> {
         Ok(Box::pin(stream::empty()))
     }
+}
+
+fn has_tool_result_id(message: &Message, id: &str) -> bool {
+    message.content.iter().any(|part| {
+        matches!(
+            part,
+            ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == id
+        )
+    })
 }
 
 #[test]
@@ -172,40 +180,38 @@ fn rule_compression_trims_conversation_and_clears_old_tool_results() {
     let conversation = compressed.conversation();
 
     assert_eq!(conversation.len(), 7);
-    assert!(matches!(conversation.first(), Some(Message::System { .. })));
+    assert_eq!(
+        conversation.first().map(|m| m.role),
+        Some(MessageRole::System)
+    );
 
     let old_tool = conversation
         .iter()
-        .find(|message| matches!(message, Message::Tool { tool_call_id, .. } if tool_call_id == "call_1"))
+        .find(|message| has_tool_result_id(message, "call_1"))
         .expect("old tool result should still exist as placeholder");
-    assert_eq!(old_tool.content(), "[Tool result cleared]");
+    assert_eq!(old_tool.text(), "[Tool result cleared]");
 
     let recent_tool = conversation
         .iter()
-        .find(|message| matches!(message, Message::Tool { tool_call_id, .. } if tool_call_id == "call_2"))
+        .find(|message| has_tool_result_id(message, "call_2"))
         .expect("recent tool result should remain");
-    assert_eq!(recent_tool.content(), "{\"matches\":[\"src/main.rs:12\"]}");
+    assert_eq!(recent_tool.text(), "{\"matches\":[\"src/main.rs:12\"]}");
 
     let cleared_reasoning = conversation
         .iter()
-        .find(|message| matches!(message, Message::Assistant { content, .. } if content == "Config loaded"))
+        .find(|message| message.role == MessageRole::Assistant && message.text() == "Config loaded")
         .expect("older assistant message should remain");
-    assert_eq!(cleared_reasoning.reasoning_content(), None);
+    assert_eq!(cleared_reasoning.reasoning(), None);
 
     let recent_reasoning = conversation
         .iter()
         .find(|message| {
-            matches!(
-                message,
-                Message::Assistant {
-                    reasoning_content: Some(reasoning),
-                    ..
-                } if reasoning == "Need grep across the repository"
-            )
+            message.role == MessageRole::Assistant
+                && message.reasoning().as_deref() == Some("Need grep across the repository")
         })
         .expect("most recent reasoning should remain");
     assert_eq!(
-        recent_reasoning.reasoning_content(),
+        recent_reasoning.reasoning().as_deref(),
         Some("Need grep across the repository")
     );
 }
@@ -232,12 +238,12 @@ fn rule_compression_can_archive_cleared_tool_results() {
     let tool_message = compressed
         .conversation()
         .into_iter()
-        .find(|message| matches!(message, Message::Tool { tool_call_id, .. } if tool_call_id == "call_1"))
+        .find(|message| has_tool_result_id(message, "call_1"))
         .expect("older tool message should remain");
 
     assert!(
         tool_message
-            .content()
+            .text()
             .contains("memory_read('/memories/compression/tool_001_call_1.md')")
     );
 
@@ -275,14 +281,14 @@ async fn model_compression_writes_summary_layer_and_keeps_recent_turns() {
 
     let conversation = compressed.conversation();
     assert_eq!(conversation.len(), 5);
-    assert!(matches!(conversation[0], Message::System { .. }));
-    assert!(matches!(conversation[1], Message::User { .. }));
-    assert_eq!(conversation[1].content(), "Search handlers");
+    assert_eq!(conversation[0].role, MessageRole::System);
+    assert_eq!(conversation[1].role, MessageRole::User);
+    assert_eq!(conversation[1].text(), "Search handlers");
 
     let output_messages = compressed.to_messages();
-    assert!(matches!(output_messages[0], Message::System { .. }));
-    assert!(matches!(output_messages[1], Message::User { .. }));
-    let memory_content = output_messages[1].content();
+    assert_eq!(output_messages[0].role, MessageRole::System);
+    assert_eq!(output_messages[1].role, MessageRole::User);
+    let memory_content = output_messages[1].text();
     assert!(memory_content.contains("[Previous conversation summary]"));
     assert!(memory_content.contains("Decided to inspect config first."));
 }
@@ -318,16 +324,17 @@ async fn model_compression_reuses_existing_summary_layer() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn chat_summary_model_adapts_chat_capability() {
-    let model = StubChatModel {
-        response: Message::assistant("summary from chat model"),
+async fn generate_summary_model_adapts_generate_capability() {
+    let model = StubGenerateModel {
+        response: Message::assistant("summary from generate model"),
     };
-    let adapter = ChatSummaryModel::new(&model, ChatRequest::new("summary-model", Vec::new()));
+    let adapter =
+        GenerateSummaryModel::new(&model, GenerateRequest::new("summary-model", Vec::new()));
 
     let summary = adapter
         .summarize("Summarize this conversation.")
         .await
-        .expect("chat adapter should summarize");
+        .expect("generate adapter should summarize");
 
-    assert_eq!(summary, "summary from chat model");
+    assert_eq!(summary, "summary from generate model");
 }

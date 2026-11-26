@@ -1,36 +1,30 @@
-//! OpenAI 兼容协议适配器（chat 与 chat 上的音频输出）。
+//! OpenAI 兼容协议适配器（覆盖文本对话、推理、工具、图文输入以及 chat 端点上的多模态输出）。
 //!
 //! 这是唯一知道 `/chat/completions` 与相关 wire 结构体的地方，也是
 //! wire ↔ 域类型映射的落点。它持有一个 [`Provider`]（厂商身份），
 //! 地址与认证由对方负责，本层只管形状。
-//!
-//! 注意：OpenRouter 的**图片**端点不在这里——它用的是 OpenRouter 自有的
-//! `/images` 形状（`resolution` / `aspect_ratio`），属于
-//! [`crate::protocols::openrouter`]。
 
 pub mod wire;
 
 use async_trait::async_trait;
-use futures::{StreamExt, stream::BoxStream};
+use futures::StreamExt;
+use serde_json::Value;
 use tracing::warn;
 
-use crate::Message;
-use crate::MessageRole;
 use crate::capability::{
-    ChatCapability, ChatChunk, ChatRequest, GenAudioCapability, GenAudioRequest, GenAudioResponse,
-    ModelError,
+    FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream,
+    ModelError, PartDelta, StreamEvent, collect_stream,
 };
-use crate::message::ToolCall;
+use crate::message::{
+    ContentPart, MediaSource, Message, MessageRole, Modality, audio_format_to_mime,
+};
 use crate::providers::Provider;
 
-use wire::{WireAudioConfig, WireChatRequest, WireResponse, WireStreamResponse, WireToolCall};
+use wire::{WireChatRequest, WireResponse, WireStreamResponse, WireToolCall};
 
 const CHAT_PATH: &str = "/chat/completions";
 
 /// OpenAI 兼容协议适配器。
-///
-/// 同一个实例可以承担 chat 与音频生成——能力是否真的可用是**端点**的属性，
-/// 由注册方断言。
 pub struct OpenAiCompatible {
     provider: Provider,
 }
@@ -51,73 +45,58 @@ impl OpenAiCompatible {
     ) -> Result<WireResponse, ModelError> {
         Ok(self.provider.post_json(CHAT_PATH, wire).await?)
     }
+}
 
-    /// 流式 chat completions。
-    ///
-    /// SSE 载荷里的 `[DONE]` 与无法解码的事件会被跳过；传输中断会记录告警后
-    /// 结束流（`ChatChunk` 本身没有错误位，中断信息通过日志暴露）。
-    pub async fn chat_completions_stream(
-        &self,
-        wire: &WireChatRequest,
-    ) -> Result<BoxStream<'static, WireStreamResponse>, ModelError> {
-        let mut wire = wire.clone();
-        wire.stream = Some(true);
+fn message_from_wire(message: wire::WireChoiceMessage, default_audio_format: &str) -> Message {
+    let mut parts = Vec::new();
 
-        let mut events = self.provider.post_sse(CHAT_PATH, &wire).await?;
+    if let Some(reasoning) = message.reasoning_content
+        && !reasoning.is_empty()
+    {
+        parts.push(ContentPart::reasoning(reasoning));
+    }
 
-        let decoded = async_stream::stream! {
-            while let Some(event) = events.next().await {
-                match event {
-                    Ok(payload) => {
-                        if payload.trim() == "[DONE]" {
-                            continue;
-                        }
-                        match serde_json::from_str::<WireStreamResponse>(&payload) {
-                            Ok(parsed) => yield parsed,
-                            Err(error) => warn!(
-                                %error,
-                                payload = %payload,
-                                "skipping undecodable stream event"
-                            ),
-                        }
-                    }
-                    Err(error) => {
-                        warn!(%error, "stream interrupted");
-                        break;
-                    }
-                }
+    if let Some(content) = message.content
+        && !content.is_empty()
+    {
+        parts.push(ContentPart::text(content));
+    }
+
+    if let Some(images) = message.images {
+        for img in images {
+            if !img.image_url.url.trim().is_empty() {
+                parts.push(ContentPart::image_url(img.image_url.url));
             }
-        };
-
-        Ok(Box::pin(decoded))
+        }
     }
+
+    if let Some(audio) = message.audio
+        && let Some(data) = audio.data.filter(|d| !d.is_empty())
+    {
+        let format = audio
+            .format
+            .as_deref()
+            .unwrap_or(default_audio_format);
+        parts.push(ContentPart::Audio {
+            source: MediaSource::base64(audio_format_to_mime(format), data),
+            transcript: audio.transcript,
+        });
+    }
+
+    if let Some(tool_calls) = message.tool_calls {
+        for call in tool_calls {
+            parts.push(ContentPart::ToolCall(call.into_domain()));
+        }
+    }
+
+    if message.role == MessageRole::Tool {
+        return Message::tool_result_parts(message.tool_call_id.unwrap_or_default(), parts, false);
+    }
+
+    Message::new(message.role, parts)
 }
 
-fn message_from_wire(message: wire::WireChoiceMessage) -> Message {
-    match message.role {
-        MessageRole::Assistant => Message::Assistant {
-            content: message.content.unwrap_or_default(),
-            reasoning_content: message.reasoning_content,
-            tool_calls: message
-                .tool_calls
-                .map(|calls| calls.into_iter().map(WireToolCall::into_domain).collect()),
-        },
-        MessageRole::User => Message::user(message.content.unwrap_or_default()),
-        MessageRole::System => Message::System {
-            content: message.content.unwrap_or_default(),
-        },
-        MessageRole::Tool => Message::Tool {
-            tool_call_id: message.tool_call_id.unwrap_or_default(),
-            content: message.content.unwrap_or_default(),
-        },
-    }
-}
-
-/// 把一条增量并进累积状态。
-///
-/// OpenAI 的流式 tool call 是按 `index` 分片送达的：首个 chunk 给出 `id` 和函数名，
-/// 后续 chunk 只带参数文本片段。这是纯 wire 层的产物（Anthropic 用的是
-/// `input_json_delta`），所以归并逻辑留在这里，不往上泄漏。
+/// 把一条流式工具调用增量并进累积状态。
 fn accumulate_tool_calls(accumulated: &mut Vec<WireToolCall>, deltas: &[WireToolCall]) {
     for delta in deltas {
         match accumulated
@@ -130,53 +109,38 @@ fn accumulate_tool_calls(accumulated: &mut Vec<WireToolCall>, deltas: &[WireTool
     }
 }
 
-/// 累积状态 → 域快照。空列表表示这个响应没有任何工具调用。
-fn accumulated_tool_calls(accumulated: &[WireToolCall]) -> Option<Vec<ToolCall>> {
-    if accumulated.is_empty() {
-        return None;
-    }
-    Some(
-        accumulated
-            .iter()
-            .cloned()
-            .map(WireToolCall::into_domain)
-            .collect(),
-    )
-}
-
-fn chunk_from_wire(response: WireStreamResponse, accumulated: &mut Vec<WireToolCall>) -> ChatChunk {
-    let usage = response.usage.map(Into::into);
-
-    match response.choices.first() {
-        Some(choice) => {
-            if let Some(deltas) = &choice.delta.tool_calls {
-                accumulate_tool_calls(accumulated, deltas);
-            }
-
-            ChatChunk {
-                content: choice.delta.content.clone().unwrap_or_default(),
-                reasoning_content: choice.delta.reasoning_content.clone().unwrap_or_default(),
-                is_finished: choice.finish_reason.is_some(),
-                finish_reason: choice.finish_reason.clone(),
-                tool_calls: accumulated_tool_calls(accumulated),
-                usage,
-            }
-        }
-        None => ChatChunk {
-            content: String::new(),
-            reasoning_content: String::new(),
-            is_finished: true,
-            finish_reason: Some("no_choices".to_string()),
-            tool_calls: accumulated_tool_calls(accumulated),
-            usage,
-        },
-    }
+/// 检查 SSE payload 是否为服务端在流内下发的错误信封。
+fn extract_stream_error(payload: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    let error = value.get("error")?;
+    error["message"]
+        .as_str()
+        .or_else(|| error.as_str())
+        .map(ToString::to_string)
 }
 
 #[async_trait]
-impl ChatCapability for OpenAiCompatible {
-    async fn chat(&self, request: ChatRequest) -> Result<Message, ModelError> {
-        let wire = WireChatRequest::from(&request);
+impl GenerateCapability for OpenAiCompatible {
+    async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
+        // OpenAI / OpenRouter 的 chat 音频输出端点要求流式接收 audio delta，
+        // 这里在协议层内部透明走流并聚合成完整 GenerateResponse。
+        if request.output_modalities.contains(&Modality::Audio) {
+            let mut response = collect_stream(self.generate_stream(request).await?).await?;
+            if response.message.content.is_empty() {
+                return Err(ModelError::NoResponse);
+            }
+            if response.finish_reason.is_none() {
+                response.finish_reason = Some(FinishReason::Stop);
+            }
+            return Ok(response);
+        }
+
+        let default_audio_format = request
+            .audio_options
+            .as_ref()
+            .and_then(|o| o.format.clone())
+            .unwrap_or_else(|| "wav".to_string());
+        let wire = WireChatRequest::try_from(&request)?;
         let response = self.chat_completions(&wire).await?;
         let choice = response
             .choices
@@ -184,69 +148,125 @@ impl ChatCapability for OpenAiCompatible {
             .next()
             .ok_or(ModelError::NoResponse)?;
 
-        Ok(message_from_wire(choice.message))
+        Ok(GenerateResponse {
+            message: message_from_wire(choice.message, &default_audio_format),
+            finish_reason: choice.finish_reason.as_deref().map(FinishReason::from_wire),
+            usage: response.usage.map(Into::into),
+            model: (!response.model.is_empty()).then_some(response.model),
+            id: (!response.id.is_empty()).then_some(response.id),
+        })
     }
 
-    async fn chat_stream(
+    async fn generate_stream(
         &self,
-        request: ChatRequest,
-    ) -> Result<BoxStream<'static, ChatChunk>, ModelError> {
-        let wire = WireChatRequest::from(&request);
-        let stream = self.chat_completions_stream(&wire).await?;
+        request: GenerateRequest,
+    ) -> Result<GenerateStream, ModelError> {
+        let default_audio_format = request
+            .audio_options
+            .as_ref()
+            .and_then(|o| o.format.clone())
+            .unwrap_or_else(|| "wav".to_string());
+        let mut wire = WireChatRequest::try_from(&request)?;
+        wire.stream = Some(true);
 
-        // 累积状态归协议层所有：上层拿到的是完整调用，不是需要自己拼的碎片。
-        Ok(stream
-            .scan(Vec::<WireToolCall>::new(), |accumulated, response| {
-                futures::future::ready(Some(chunk_from_wire(response, accumulated)))
-            })
-            .boxed())
-    }
-}
+        let mut events = self.provider.post_sse(CHAT_PATH, &wire).await?;
 
-#[async_trait]
-impl GenAudioCapability for OpenAiCompatible {
-    async fn gen_audio(&self, request: GenAudioRequest) -> Result<GenAudioResponse, ModelError> {
-        let format = request.format.unwrap_or_else(|| "wav".to_string());
-        let base = ChatRequest::new(request.model, vec![Message::user(request.prompt)]);
-        let mut wire = WireChatRequest::from(&base);
-        wire.modalities = Some(vec!["text".to_string(), "audio".to_string()]);
-        wire.audio = Some(WireAudioConfig {
-            format: format.clone(),
-            voice: request.voice,
-        });
+        let stream = async_stream::stream! {
+            let mut accumulated_tools: Vec<WireToolCall> = Vec::new();
 
-        let mut stream = self.chat_completions_stream(&wire).await?;
-        let mut audio_data = String::new();
-        let mut transcript = String::new();
-
-        while let Some(response) = stream.next().await {
-            for choice in response.choices {
-                if let Some(audio) = choice.delta.audio {
-                    if let Some(data) = audio.data {
-                        audio_data.push_str(&data);
+            while let Some(item) = events.next().await {
+                let sse_event = match item {
+                    Ok(ev) => ev,
+                    Err(error) => {
+                        yield Err(ModelError::from(error));
+                        return;
                     }
-                    if let Some(chunk) = audio.transcript {
-                        transcript.push_str(&chunk);
+                };
+
+                if sse_event.event.as_deref() == Some("error") {
+                    let message = extract_stream_error(&sse_event.data)
+                        .unwrap_or(sse_event.data);
+                    yield Err(ModelError::StreamError(message));
+                    return;
+                }
+
+                let payload = sse_event.data.trim();
+                if payload == "[DONE]" {
+                    continue;
+                }
+
+                if let Some(error_msg) = extract_stream_error(payload) {
+                    yield Err(ModelError::StreamError(error_msg));
+                    return;
+                }
+
+                let parsed = match serde_json::from_str::<WireStreamResponse>(payload) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        warn!(%error, payload, "skipping undecodable stream event");
+                        continue;
+                    }
+                };
+
+                if let Some(choice) = parsed.choices.into_iter().next() {
+                    if let Some(reasoning) = choice.delta.reasoning_content
+                        && !reasoning.is_empty()
+                    {
+                        yield Ok(StreamEvent::Delta(PartDelta::Reasoning { text: reasoning }));
+                    }
+
+                    if let Some(text) = choice.delta.content
+                        && !text.is_empty()
+                    {
+                        yield Ok(StreamEvent::Delta(PartDelta::Text { text }));
+                    }
+
+                    if let Some(images) = choice.delta.images {
+                        for img in images {
+                            if !img.image_url.url.trim().is_empty() {
+                                yield Ok(StreamEvent::Part(ContentPart::image_url(img.image_url.url)));
+                            }
+                        }
+                    }
+
+                    if let Some(audio) = choice.delta.audio {
+                        yield Ok(StreamEvent::Delta(PartDelta::Audio {
+                            data: audio.data,
+                            transcript: audio.transcript,
+                            format: audio.format.or_else(|| Some(default_audio_format.clone())),
+                        }));
+                    }
+
+                    if let Some(deltas) = &choice.delta.tool_calls {
+                        accumulate_tool_calls(&mut accumulated_tools, deltas);
+                    }
+
+                    if let Some(reason) = choice.finish_reason {
+                        for call in accumulated_tools.drain(..) {
+                            yield Ok(StreamEvent::Part(ContentPart::ToolCall(call.into_domain())));
+                        }
+                        yield Ok(StreamEvent::Finished {
+                            reason: Some(FinishReason::from_wire(&reason)),
+                        });
                     }
                 }
+
+                if let Some(usage) = parsed.usage {
+                    yield Ok(StreamEvent::Usage(usage.into()));
+                }
             }
-        }
 
-        if audio_data.is_empty() {
-            return Err(ModelError::NoResponse);
-        }
+            // 兼容省略 finish_reason 的服务端：流末尾兜底冲刷累积工具调用。
+            for call in accumulated_tools.drain(..) {
+                yield Ok(StreamEvent::Part(ContentPart::ToolCall(call.into_domain())));
+            }
+        };
 
-        Ok(GenAudioResponse {
-            audio_data,
-            transcript,
-            format,
-        })
+        Ok(Box::pin(stream))
     }
 }
 
 /// 协议层测试共用的假传输：只记录请求、按剧本回放响应。
-///
-/// 传输缝存在之后，协议层测试不再需要起真实 TCP 服务端。
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -284,12 +304,10 @@ pub(crate) mod testing {
             })
         }
 
-        /// 记录到的 (url, body) 列表。
         pub fn recorded(&self) -> Vec<(String, Value)> {
             self.requests.lock().unwrap().clone()
         }
 
-        /// 记录到的请求路径（去掉 base_url 前缀）。
         pub fn recorded_paths(&self) -> Vec<String> {
             self.recorded()
                 .into_iter()
@@ -297,7 +315,6 @@ pub(crate) mod testing {
                 .collect()
         }
 
-        /// 记录到的第一个请求体。
         pub fn first_body(&self) -> Value {
             self.recorded()
                 .into_iter()
@@ -307,7 +324,6 @@ pub(crate) mod testing {
         }
     }
 
-    /// 用假传输装出一个厂商端点。
     pub fn fake_provider(transport: Arc<FakeTransport>) -> Provider {
         Provider::new(transport, "fake", BASE_URL).with_bearer("test-key")
     }
@@ -377,23 +393,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_posts_to_chat_completions_and_maps_to_domain_message() {
+    async fn generate_posts_to_chat_completions_and_maps_to_domain_response() {
         let transport = FakeTransport::with_json(chat_wire_response("hello"));
         let model = OpenAiCompatible::new(fake_provider(transport.clone()));
 
-        let message = model
-            .chat(ChatRequest::new("m", vec![Message::user("hi")]))
+        let response = model
+            .generate(GenerateRequest::new("m", vec![Message::user("hi")]))
             .await
             .unwrap();
 
-        assert_eq!(message, Message::assistant("hello"));
+        assert_eq!(response.message, Message::assistant("hello"));
+        assert_eq!(response.finish_reason, Some(FinishReason::Stop));
         assert_eq!(transport.recorded_paths(), vec!["/chat/completions"]);
         assert_eq!(transport.first_body()["model"], "m");
         assert!(transport.first_body().get("stream").is_none());
     }
 
     #[tokio::test]
-    async fn chat_stream_decodes_events_and_skips_done_marker() {
+    async fn generate_stream_decodes_events_and_skips_done_marker() {
         let transport = FakeTransport::with_raw_events(vec![
             json!({
                 "id": "1", "object": "chat.completion.chunk", "created": 1, "model": "m",
@@ -411,19 +428,30 @@ mod tests {
         ]);
         let model = OpenAiCompatible::new(fake_provider(transport));
 
-        let chunks = model
-            .chat_stream(ChatRequest::new("m", vec![Message::user("hi")]))
+        let events: Vec<StreamEvent> = model
+            .generate_stream(GenerateRequest::new("m", vec![Message::user("hi")]))
             .await
             .unwrap()
             .collect::<Vec<_>>()
-            .await;
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].content, "he");
-        assert!(!chunks[0].is_finished);
-        assert_eq!(chunks[1].content, "llo");
-        assert!(chunks[1].is_finished);
-        assert_eq!(chunks[1].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Delta(PartDelta::Text {
+                    text: "he".to_string()
+                }),
+                StreamEvent::Delta(PartDelta::Text {
+                    text: "llo".to_string()
+                }),
+                StreamEvent::Finished {
+                    reason: Some(FinishReason::Stop)
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -432,7 +460,7 @@ mod tests {
         let model = OpenAiCompatible::new(fake_provider(transport.clone()));
 
         model
-            .chat_stream(ChatRequest::new("m", vec![]))
+            .generate_stream(GenerateRequest::new("m", vec![]))
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -442,7 +470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gen_audio_builds_modalities_and_collects_streamed_chunks() {
+    async fn audio_generate_builds_modalities_and_collects_streamed_chunks() {
         let transport = FakeTransport::with_events(vec![
             audio_chunk("abc", "hello "),
             audio_chunk("def", "world"),
@@ -450,16 +478,20 @@ mod tests {
         let model = OpenAiCompatible::new(fake_provider(transport.clone()));
 
         let response = model
-            .gen_audio(GenAudioRequest::new(
+            .generate(GenerateRequest::audio(
                 "google/lyria-3-clip-preview",
                 "Generate a short piano loop",
             ))
             .await
             .unwrap();
 
-        assert_eq!(response.audio_data, "abcdef");
-        assert_eq!(response.transcript, "hello world");
-        assert_eq!(response.format, "wav");
+        let audios = response.message.audios();
+        assert_eq!(audios.len(), 1);
+        assert_eq!(
+            audios[0].0,
+            &MediaSource::base64("audio/wav", "abcdef")
+        );
+        assert_eq!(audios[0].1, Some("hello world"));
 
         let body = transport.first_body();
         assert_eq!(transport.recorded_paths(), vec!["/chat/completions"]);
@@ -500,23 +532,23 @@ mod tests {
         ]);
         let model = OpenAiCompatible::new(fake_provider(transport));
 
-        let chunks = model
-            .chat_stream(ChatRequest::new("m", vec![Message::user("hi")]))
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await;
+        let response = collect_stream(
+            model
+                .generate_stream(GenerateRequest::new("m", vec![Message::user("hi")]))
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        // 上层拿到的是累积快照，最后一帧是完整调用——不需要自己拼接。
-        let last = chunks.last().unwrap();
-        assert!(last.is_finished);
+        assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
         assert_eq!(
-            last.tool_calls,
-            Some(vec![ToolCall {
+            response.message.tool_calls(),
+            vec![&ToolCall {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 arguments: json!({ "path": "a.txt" }),
-            }])
+            }]
         );
     }
 
@@ -527,24 +559,19 @@ mod tests {
 
         let messages = vec![
             Message::user("hi"),
-            Message::Assistant {
-                content: String::new(),
-                reasoning_content: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_1".to_string(),
-                    name: "read_file".to_string(),
-                    arguments: json!({ "path": "a.txt" }),
-                }]),
-            },
-            Message::Tool {
-                tool_call_id: "call_1".to_string(),
-                content: "{}".to_string(),
-            },
+            Message::assistant_parts(vec![ContentPart::ToolCall(ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "a.txt" }),
+            })]),
+            Message::tool_result("call_1", "{}"),
         ];
 
-        model.chat(ChatRequest::new("m", messages)).await.unwrap();
+        model
+            .generate(GenerateRequest::new("m", messages))
+            .await
+            .unwrap();
 
-        // 域形状 {id, name, arguments} → wire 嵌套 {type, function:{name, arguments 文本}}
         let body = transport.first_body();
         let call = &body["messages"][1]["tool_calls"][0];
         assert_eq!(call["id"], "call_1");
@@ -562,12 +589,14 @@ mod tests {
         let model = OpenAiCompatible::new(fake_provider(transport.clone()));
 
         model
-            .chat(
-                ChatRequest::new("m", vec![Message::user("hi")]).with_tools(Some(vec![ToolDef {
-                    name: "read_file".to_string(),
-                    description: "read a file".to_string(),
-                    parameters: json!({ "type": "object" }),
-                }])),
+            .generate(
+                GenerateRequest::new("m", vec![Message::user("hi")]).with_tools(Some(vec![
+                    ToolDef {
+                        name: "read_file".to_string(),
+                        description: "read a file".to_string(),
+                        parameters: json!({ "type": "object" }),
+                    },
+                ])),
             )
             .await
             .unwrap();
