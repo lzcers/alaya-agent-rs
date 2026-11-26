@@ -1,0 +1,340 @@
+use async_trait::async_trait;
+use futures::stream;
+use serde_json::{Value, json};
+use tempfile::tempdir;
+
+use crate::compress::{
+    ConversationRule, GenerateSummaryModel, LayerAction, LayerRule, LayerSelector,
+    ModelCompression, RuleCompression, SummaryModel,
+};
+use crate::{Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall};
+use alaya_model::capability::{
+    FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream, ModelError,
+};
+use alaya_model::{ContentPart, Message, MessageRole};
+
+fn conversation_with_tools_and_reasoning() -> Vec<Message> {
+    vec![
+        Message::system("Conversation system"),
+        Message::user("Open the config"),
+        Message::assistant_parts(vec![
+            ContentPart::reasoning("Need to inspect the config first"),
+            ContentPart::tool_call(ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "config.json" }),
+            }),
+        ]),
+        Message::tool_result("call_1", "{\"debug\":true}"),
+        Message::assistant_parts(vec![
+            ContentPart::reasoning("Debug mode is enabled"),
+            ContentPart::text("Config loaded"),
+        ]),
+        Message::user("Search handlers"),
+        Message::assistant_parts(vec![
+            ContentPart::reasoning("Need grep across the repository"),
+            ContentPart::tool_call(ToolCall {
+                id: "call_2".to_string(),
+                name: "file_search".to_string(),
+                arguments: json!({ "pattern": "handler" }),
+            }),
+        ]),
+        Message::tool_result("call_2", "{\"matches\":[\"src/main.rs:12\"]}"),
+        Message::assistant("Found one handler"),
+    ]
+}
+
+fn context_with_layers() -> Context {
+    let mut readonly_memory = Layer::new(
+        "readonly_memory",
+        LayerKind::Memory,
+        json!([{ "content": "do not edit" }]),
+    );
+    readonly_memory.meta.readonly = true;
+
+    let mut tagged_notes = Layer::new(
+        "notes",
+        LayerKind::Custom("notes".to_string()),
+        json!(["a", "b", "c", "d"]),
+    );
+    tagged_notes.meta.tags = vec!["trim".to_string(), "temp".to_string()];
+
+    Context::new()
+        .layer(Layer::new(
+            "system",
+            LayerKind::System,
+            Value::String("Be concise".to_string()),
+        ))
+        .layer(readonly_memory)
+        .layer(tagged_notes)
+        .layer(Layer::new(
+            "conversation",
+            LayerKind::Conversation,
+            serde_json::to_value(conversation_with_tools_and_reasoning())
+                .expect("messages should serialize"),
+        ))
+}
+
+struct StubSummaryModel;
+
+#[async_trait]
+impl SummaryModel for StubSummaryModel {
+    async fn summarize(&self, prompt: &str) -> Result<String, ModelError> {
+        assert!(prompt.contains("Open the config"));
+        assert!(prompt.contains("assistant_tool_call: read_file"));
+        Ok("Decided to inspect config first.\nNeed to revisit handlers.".to_string())
+    }
+}
+
+struct StubGenerateModel {
+    response: Message,
+}
+
+#[async_trait]
+impl GenerateCapability for StubGenerateModel {
+    async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, MessageRole::System);
+        assert_eq!(request.messages[1].role, MessageRole::User);
+        Ok(GenerateResponse {
+            message: self.response.clone(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+            model: Some(request.model),
+            id: None,
+        })
+    }
+
+    async fn generate_stream(
+        &self,
+        _request: GenerateRequest,
+    ) -> Result<GenerateStream, ModelError> {
+        Ok(Box::pin(stream::empty()))
+    }
+}
+
+fn has_tool_result_id(message: &Message, id: &str) -> bool {
+    message.content.iter().any(|part| {
+        matches!(
+            part,
+            ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == id
+        )
+    })
+}
+
+#[test]
+fn rule_compression_applies_layer_rules_and_skips_readonly_by_default() {
+    let context = context_with_layers();
+    let rule = RuleCompression {
+        layer_rules: vec![
+            LayerRule {
+                selector: LayerSelector {
+                    tags: vec!["trim".to_string()],
+                    ..LayerSelector::default()
+                },
+                action: LayerAction::TrimArray {
+                    keep_head: 1,
+                    keep_tail: 1,
+                },
+            },
+            LayerRule {
+                selector: LayerSelector {
+                    kind: Some(LayerKind::Memory),
+                    ..LayerSelector::default()
+                },
+                action: LayerAction::Clear,
+            },
+        ],
+        conversation: None,
+    };
+
+    let compressed = context
+        .compress_by_rule(&rule)
+        .expect("rule compression should work");
+
+    let notes = compressed.get("notes").expect("notes layer should remain");
+    assert_eq!(notes.data, json!(["a", "d"]));
+
+    let readonly = compressed
+        .get("readonly_memory")
+        .expect("readonly layer should remain untouched");
+    assert_eq!(readonly.data, json!([{ "content": "do not edit" }]));
+}
+
+#[test]
+fn rule_compression_trims_conversation_and_clears_old_tool_results() {
+    let context = context_with_layers();
+    let rule = RuleCompression {
+        layer_rules: Vec::new(),
+        conversation: Some(ConversationRule {
+            keep_recent_messages: 6,
+            keep_recent_tool_results: 1,
+            clear_reasoning: true,
+            keep_recent_reasoning_turns: 1,
+        }),
+    };
+
+    let compressed = context
+        .compress_by_rule(&rule)
+        .expect("rule compression should work");
+    let conversation = compressed.conversation();
+
+    assert_eq!(conversation.len(), 7);
+    assert_eq!(
+        conversation.first().map(|m| m.role),
+        Some(MessageRole::System)
+    );
+
+    let old_tool = conversation
+        .iter()
+        .find(|message| has_tool_result_id(message, "call_1"))
+        .expect("old tool result should still exist as placeholder");
+    assert_eq!(old_tool.text(), "[Tool result cleared]");
+
+    let recent_tool = conversation
+        .iter()
+        .find(|message| has_tool_result_id(message, "call_2"))
+        .expect("recent tool result should remain");
+    assert_eq!(recent_tool.text(), "{\"matches\":[\"src/main.rs:12\"]}");
+
+    let cleared_reasoning = conversation
+        .iter()
+        .find(|message| message.role == MessageRole::Assistant && message.text() == "Config loaded")
+        .expect("older assistant message should remain");
+    assert_eq!(cleared_reasoning.reasoning(), None);
+
+    let recent_reasoning = conversation
+        .iter()
+        .find(|message| {
+            message.role == MessageRole::Assistant
+                && message.reasoning().as_deref() == Some("Need grep across the repository")
+        })
+        .expect("most recent reasoning should remain");
+    assert_eq!(
+        recent_reasoning.reasoning().as_deref(),
+        Some("Need grep across the repository")
+    );
+}
+
+#[test]
+fn rule_compression_can_archive_cleared_tool_results() {
+    let root = tempdir().expect("temp dir should exist");
+    let mut memory =
+        FsMemoryStore::new(MemoryConfig::new(root.path())).expect("memory store should exist");
+    let context = context_with_layers();
+    let rule = RuleCompression {
+        layer_rules: Vec::new(),
+        conversation: Some(ConversationRule {
+            keep_recent_messages: usize::MAX,
+            keep_recent_tool_results: 1,
+            clear_reasoning: false,
+            keep_recent_reasoning_turns: 1,
+        }),
+    };
+
+    let compressed = context
+        .compress_by_rule_with_archive(&rule, &mut memory)
+        .expect("rule compression should work");
+    let tool_message = compressed
+        .conversation()
+        .into_iter()
+        .find(|message| has_tool_result_id(message, "call_1"))
+        .expect("older tool message should remain");
+
+    assert!(
+        tool_message
+            .text()
+            .contains("memory_read('/memories/compression/tool_001_call_1.md')")
+    );
+
+    let listing = memory
+        .view("/memories/compression", None)
+        .expect("archive listing should work")
+        .to_string();
+    assert!(listing.contains("/memories/compression/tool_001_call_1.md"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_compression_writes_summary_layer_and_keeps_recent_turns() {
+    let context = context_with_layers();
+    let options = ModelCompression {
+        keep_recent_turns: 1,
+        ..ModelCompression::default()
+    };
+
+    let compressed = context
+        .compress_by_model(&StubSummaryModel, &options)
+        .await
+        .expect("model compression should work");
+
+    let summary_layer = compressed
+        .get("conversation_summary")
+        .expect("summary layer should exist");
+    assert_eq!(summary_layer.kind, LayerKind::Memory);
+    assert!(
+        summary_layer
+            .meta
+            .tags
+            .iter()
+            .any(|tag| tag == "compressed_summary")
+    );
+
+    let conversation = compressed.conversation();
+    assert_eq!(conversation.len(), 5);
+    assert_eq!(conversation[0].role, MessageRole::System);
+    assert_eq!(conversation[1].role, MessageRole::User);
+    assert_eq!(conversation[1].text(), "Search handlers");
+
+    let output_messages = compressed.to_messages();
+    assert_eq!(output_messages[0].role, MessageRole::System);
+    assert_eq!(output_messages[1].role, MessageRole::User);
+    let memory_content = output_messages[1].text();
+    assert!(memory_content.contains("[Previous conversation summary]"));
+    assert!(memory_content.contains("Decided to inspect config first."));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_compression_reuses_existing_summary_layer() {
+    let mut context = context_with_layers();
+    let mut existing_summary = Layer::new(
+        "conversation_summary",
+        LayerKind::Memory,
+        json!([{ "content": "[Previous conversation summary]" }, { "content": "Earlier summary" }]),
+    );
+    existing_summary.meta.tags = vec!["compressed_summary".to_string()];
+    context.layers.push(existing_summary);
+
+    let options = ModelCompression {
+        keep_recent_turns: 1,
+        include_existing_summary: true,
+        ..ModelCompression::default()
+    };
+
+    let compressed = context
+        .compress_by_model(&StubSummaryModel, &options)
+        .await
+        .expect("model compression should work");
+
+    let summary_layers = compressed
+        .layers
+        .iter()
+        .filter(|layer| layer.name == "conversation_summary")
+        .count();
+    assert_eq!(summary_layers, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn generate_summary_model_adapts_generate_capability() {
+    let model = StubGenerateModel {
+        response: Message::assistant("summary from generate model"),
+    };
+    let adapter =
+        GenerateSummaryModel::new(&model, GenerateRequest::new("summary-model", Vec::new()));
+
+    let summary = adapter
+        .summarize("Summarize this conversation.")
+        .await
+        .expect("generate adapter should summarize");
+
+    assert_eq!(summary, "summary from generate model");
+}

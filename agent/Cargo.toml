@@ -1,0 +1,23 @@
+[package]
+name = "alaya-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alaya-model.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+glob.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+dotenv.workspace = true
+tempfile.workspace = true

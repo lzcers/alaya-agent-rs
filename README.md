@@ -18,6 +18,15 @@
 - **上下文压缩** —— 规则压缩（drop / clear / trim / replace）和模型摘要压缩
 - **完整指标追踪** —— 时间线、迭代次数、Token 用量、延迟、工具调用统计、错误记录
 
+## Workspace 结构
+
+本项目是一个多 crate Cargo Workspace，底层模型调用栈与上层 Agent 编排完全解耦，可独立按需引入：
+
+```text
+├── model/   # alaya-model：transport / providers / protocols / capability / router / endpoints / message / usage
+└── agent/   # alaya-agent（依赖 alaya-model）：AgentActor / Context / Hooks / Tools / Compress / Memory / Select
+```
+
 ## 架构
 
 ```
@@ -73,10 +82,10 @@
 
 ## 快速开始
 
-### 最简示例：文本对话
+### 最简示例：文本对话（仅依赖 `alaya-model`）
 
 ```rust
-use alaya_agent::{
+use alaya_model::{
     Message,
     capability::{GenerateCapability, GenerateRequest, ModelProfile},
     endpoints::deepseek_from_env,
@@ -85,9 +94,7 @@ use alaya_agent::{
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
-
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = Arc::new(deepseek_from_env()?);
     let mut router = ModelRouter::new();
     router.register("deepseek-chat", ModelProfile::text(), model);
@@ -107,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
 ### 流式对话
 
 ```rust
-use alaya_agent::{
+use alaya_model::{
     Message,
     capability::{GenerateCapability, GenerateRequest, ModelProfile, PartDelta, StreamEvent},
     endpoints::openrouter_from_env,
@@ -117,9 +124,7 @@ use futures::StreamExt;
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
-
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = Arc::new(openrouter_from_env()?);
     let mut router = ModelRouter::new();
     router.register("google/gemini-2.5-flash", ModelProfile::omni(), model);
@@ -146,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
 ### 图片 / 音频生成（统一入口）
 
 ```rust
-use alaya_agent::{
+use alaya_model::{
     capability::{
         AudioOptions, GenerateCapability, GenerateRequest, ImageOptions, ModelProfile,
     },
@@ -190,20 +195,20 @@ let audio_resp = router
 | 厂商情况 | 需要实现 | 代码 |
 |----------|----------|------|
 | **兼容 OpenAI** | **0 个 trait** | `endpoints::openai_compatible(name, key, base_url)` |
-| **自有协议**（Anthropic / Gemini / Bedrock） | **1 个 `GenerateCapability` trait**；认证由 `Provider::with_header_auth` / `with_query_auth` / `with_auth(Auth::Custom(...))` 承担 | 见 `tests/custom_vendor.rs` |
+| **自有协议**（Anthropic / Gemini / Bedrock） | **1 个 `GenerateCapability` trait**；认证由 `Provider::with_header_auth` / `with_query_auth` / `with_auth(Auth::Custom(...))` 承担 | 见 `model/tests/custom_vendor.rs` |
 
 ## 模块说明
 
-| 模块 | 说明 |
-|------|------|
-| `message` / `usage` | 统一多模态域 IR：`Message`、`MessageRole`、`Modality`、`ContentPart`、`MediaSource`、`ToolDef`、`ToolCall`、`Usage` |
-| `capability` | 统一能力层：`GenerateCapability`、`GenerateRequest`、`GenerateResponse`、`StreamEvent`、`StreamAccumulator`、`ModelProfile`、`ModelError` |
-| `protocols` | 协议层：`OpenAiCompatible`、`OpenRouterImages` |
-| `endpoints` | 端点预设：`openai_compatible`、`deepseek`、`openrouter` |
-| `providers` | 厂商身份：`Provider`、`Auth`、`RequestAuth` |
-| `transport` | 传输层：`Transport` trait、`HttpTransport`、`HttpRequest` / `HttpResponse`、`SseEvent`、`TransportError` |
-| `router` | 分发层：`ModelRouter`、`ModelRoute`（能力画像校验、逻辑名/别名映射、主备切换） |
-| `agent` | Agent 编排层：`Context`、`AgentActor`、Lifecycle Hooks、工具执行、上下文压缩、记忆与文件选择 |
+| Crate | 模块 | 说明 |
+|-------|------|------|
+| `alaya-model` | `message` / `usage` | 统一多模态域 IR：`Message`、`MessageRole`、`Modality`、`ContentPart`、`MediaSource`、`ToolDef`、`ToolCall`、`Usage` |
+| `alaya-model` | `capability` | 统一能力层：`GenerateCapability`、`GenerateRequest`、`GenerateResponse`、`StreamEvent`、`StreamAccumulator`、`ModelProfile`、`ModelError` |
+| `alaya-model` | `protocols` | 协议层：`OpenAiCompatible`、`OpenRouterImages` |
+| `alaya-model` | `endpoints` | 端点预设：`openai_compatible`、`deepseek`、`openrouter` |
+| `alaya-model` | `providers` | 厂商身份：`Provider`、`Auth`、`RequestAuth` |
+| `alaya-model` | `transport` | 传输层：`Transport` trait、`HttpTransport`、`HttpRequest` / `HttpResponse`、`SseEvent`、`TransportError` |
+| `alaya-model` | `router` | 分发层：`ModelRouter`、`ModelRoute`（能力画像校验、逻辑名/别名映射、主备切换） |
+| `alaya-agent` | `agent_actor` / `context` / `hooks` / `tools` / `compress` / `memory` / `select` | Agent 编排层：`Context`、`AgentActor`、Lifecycle Hooks、工具执行、上下文压缩、记忆与文件选择 |
 
 ## 环境变量
 
