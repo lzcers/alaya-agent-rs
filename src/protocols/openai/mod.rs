@@ -102,9 +102,7 @@ fn message_from_wire(message: wire::WireChoiceMessage) -> Message {
                 .tool_calls
                 .map(|calls| calls.into_iter().map(WireToolCall::into_domain).collect()),
         },
-        MessageRole::User => Message::User {
-            content: message.content.unwrap_or_default(),
-        },
+        MessageRole::User => Message::user(message.content.unwrap_or_default()),
         MessageRole::System => Message::System {
             content: message.content.unwrap_or_default(),
         },

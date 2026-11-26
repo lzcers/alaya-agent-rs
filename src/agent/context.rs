@@ -351,7 +351,7 @@ fn layer_to_user_content(layer: &Layer) -> Option<String> {
 fn format_message_as_text(message: &Message) -> String {
     match message {
         Message::System { content } => format!("system: \n{}", content),
-        Message::User { content } => format!("user: \n{}", content),
+        Message::User { content } => format!("user: \n{}", content.to_display_text()),
         Message::Assistant { content, .. } => format!("assistant: \n{}", content),
         Message::Tool { content, .. } => format!("tool: \n{}", content),
     }

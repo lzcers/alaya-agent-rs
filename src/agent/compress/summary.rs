@@ -103,10 +103,11 @@ fn transcript_lines(message: &Message) -> Vec<String> {
             }
         }
         Message::User { content } => {
-            if content.trim().is_empty() {
+            let text = content.to_display_text();
+            if text.trim().is_empty() {
                 Vec::new()
             } else {
-                vec![format!("user: {content}")]
+                vec![format!("user: {text}")]
             }
         }
         Message::Assistant {

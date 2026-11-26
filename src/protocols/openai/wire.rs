@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::MessageRole;
 use crate::capability::ChatRequest;
-use crate::message::{Message, ToolCall};
+use crate::message::{Message, ToolCall, UserContent};
 
 // ============================================================================
 // 容错反序列化
@@ -123,7 +123,7 @@ pub enum WireMessage {
     #[serde(rename = "system")]
     System { content: String },
     #[serde(rename = "user")]
-    User { content: String },
+    User { content: UserContent },
     #[serde(rename = "assistant")]
     Assistant {
         content: String,

@@ -246,7 +246,7 @@ where
                     if input_id == expected_input_id {
                         self.state
                             .context
-                            .add_message(Message::User { content: input });
+                            .add_message(Message::user(input));
                         self.state.state = JobState::Running;
                         self.pending_user_input = None;
                         LoopState::Runnable
