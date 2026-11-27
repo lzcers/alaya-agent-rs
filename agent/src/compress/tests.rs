@@ -328,8 +328,7 @@ async fn generate_summary_model_adapts_generate_capability() {
     let model = StubGenerateModel {
         response: Message::assistant("summary from generate model"),
     };
-    let adapter =
-        GenerateSummaryModel::new(&model, GenerateRequest::new("summary-model", Vec::new()));
+    let adapter = GenerateSummaryModel::new(&model, "summary-model");
 
     let summary = adapter
         .summarize("Summarize this conversation.")

@@ -14,8 +14,8 @@ use crate::hooks::send_model_evt::SendModelEvtHook;
 use crate::tools::execute_tools;
 use crate::{AgentState, ToolCall, ToolExecutor, ToolResult};
 use alaya_model::capability::{
-    FinishReason, GenerateCapability, GenerateRequest, StreamAccumulator, StreamEvent,
-    format_model_error,
+    FinishReason, GenerateCapability, GenerateConfig, GenerateRequest, StreamAccumulator,
+    StreamEvent, format_model_error,
 };
 use alaya_model::{Message, Usage};
 
@@ -207,7 +207,8 @@ impl StepLifeCycle {
     pub(super) async fn start(
         &mut self,
         model: &(dyn GenerateCapability + Sync),
-        request: &GenerateRequest,
+        model_name: &str,
+        config: &GenerateConfig,
         tool_executor: &dyn ToolExecutor,
         event_tx: Option<&mpsc::Sender<AgentActorEvent>>,
     ) -> LifeCycleFlow {
@@ -220,7 +221,9 @@ impl StepLifeCycle {
         self.call_life_cycle_hook(LifeCycle::BeforeCallModel)
             .await?;
 
-        let request = request.clone().with_messages(messages).with_tools(tools);
+        let request = GenerateRequest::new(model_name, messages)
+            .with_tools(tools)
+            .with_config(config.clone());
         let mut stream = match model.generate_stream(request).await {
             Ok(stream) => stream,
             Err(err) => {

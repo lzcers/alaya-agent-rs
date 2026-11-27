@@ -181,12 +181,7 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
         "请帮我总结 https://www.peopleapp.com/column/30051629695-500007391518 网页的内容",
     );
 
-    let actor = AgentActor::new(
-        model,
-        GenerateRequest::new("deepseek-reasoner", Vec::new()),
-        executor,
-        context,
-    );
+    let actor = AgentActor::new(model, "deepseek-reasoner", executor, context);
 
     let mut handle = actor.run_loop();
 
@@ -365,12 +360,7 @@ async fn test_agent_actor_accumulates_usage_from_stream_response() {
     let mut context = Context::new();
     context.add_message(Message::user("hello"));
 
-    let mut actor = AgentActor::new(
-        model,
-        GenerateRequest::new("mock-model", Vec::new()),
-        executor,
-        context,
-    );
+    let mut actor = AgentActor::new(model, "mock-model", executor, context);
     let result = actor.run_step(None).await;
 
     assert!(matches!(result, crate::StepResult::Done { .. }));
@@ -411,12 +401,7 @@ async fn test_agent_actor_emits_step_frame_metrics_to_upper_layer() {
     let mut context = Context::new();
     context.add_message(Message::user("hello"));
 
-    let mut actor = AgentActor::new(
-        model,
-        GenerateRequest::new("mock-model", Vec::new()),
-        executor,
-        context,
-    );
+    let mut actor = AgentActor::new(model, "mock-model", executor, context);
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let result = actor.run_step(Some(event_tx)).await;
 
@@ -460,12 +445,7 @@ async fn test_agent_actor_records_error_metrics_when_max_iterations_exceeded() {
     let mut context = Context::new();
     context.add_message(Message::user("hello"));
 
-    let mut actor = AgentActor::new(
-        model,
-        GenerateRequest::new("mock-model", Vec::new()),
-        executor,
-        context,
-    );
+    let mut actor = AgentActor::new(model, "mock-model", executor, context);
     actor.state_mut().metrics.execution.max_iterations = 0;
 
     let result = actor.run_step(None).await;

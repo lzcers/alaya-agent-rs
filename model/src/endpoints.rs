@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use crate::capability::{
     GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream, ModelError,
 };
-use crate::message::Modality;
 use crate::protocols::{OpenAiCompatible, OpenRouterImages};
 use crate::providers::Provider;
 use crate::transport::{HttpTransport, Transport, TransportError};
@@ -90,7 +89,7 @@ impl OpenRouter {
     }
 
     fn is_dedicated_image_request(request: &GenerateRequest) -> bool {
-        request.output_modalities == [Modality::Image]
+        request.config.is_pure_image()
     }
 }
 

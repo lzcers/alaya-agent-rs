@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::memory::MemoryError;
 use crate::{Layer, LayerKind};
-use alaya_model::capability::{GenerateCapability, GenerateRequest, ModelError};
+use alaya_model::capability::{GenerateCapability, GenerateConfig, GenerateRequest, ModelError};
 use alaya_model::{Message, MessageRole};
 
 #[async_trait]
@@ -154,17 +154,24 @@ impl Default for ModelCompression {
 
 pub struct GenerateSummaryModel<'a, M> {
     model: &'a M,
-    request: GenerateRequest,
+    model_name: String,
+    config: GenerateConfig,
     system_prompt: String,
 }
 
 impl<'a, M> GenerateSummaryModel<'a, M> {
-    pub fn new(model: &'a M, request: GenerateRequest) -> Self {
+    pub fn new(model: &'a M, model_name: impl Into<String>) -> Self {
         Self {
             model,
-            request,
+            model_name: model_name.into(),
+            config: GenerateConfig::default(),
             system_prompt: DEFAULT_SUMMARY_SYSTEM_PROMPT.to_string(),
         }
+    }
+
+    pub fn with_config(mut self, config: GenerateConfig) -> Self {
+        self.config = config;
+        self
     }
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -179,13 +186,15 @@ where
     M: GenerateCapability + Send + Sync,
 {
     async fn summarize(&self, prompt: &str) -> Result<String, ModelError> {
-        let response = self
-            .model
-            .generate(self.request.clone().with_messages(vec![
+        let request = GenerateRequest::new(
+            self.model_name.clone(),
+            vec![
                 Message::system(self.system_prompt.clone()),
                 Message::user(prompt),
-            ]))
-            .await?;
+            ],
+        )
+        .with_config(self.config.clone());
+        let response = self.model.generate(request).await?;
 
         if response.message.role == MessageRole::Assistant {
             let text = response.message.text();

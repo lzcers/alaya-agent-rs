@@ -42,7 +42,7 @@ impl<'a> From<&'a GenerateRequest> for AcmeRequest<'a> {
         Self {
             engine: &request.model,
             prompt: &request.messages,
-            max_new_tokens: request.max_tokens,
+            max_new_tokens: request.config.max_tokens,
         }
     }
 }

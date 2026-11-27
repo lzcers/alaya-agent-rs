@@ -10,7 +10,8 @@ mod generate;
 
 pub use error::{ModelError, format_model_error};
 pub use generate::{
-    AudioOptions, FinishReason, GenerateCapability, GenerateRequest, GenerateResponse,
-    GenerateStream, ImageOptions, ModelProfile, PartDelta, ReasoningConfig, ReasoningEffort,
-    ResponseFormat, StreamAccumulator, StreamEvent, ToolChoice, collect_stream,
+    AudioOptions, FinishReason, GenerateCapability, GenerateConfig, GenerateRequest,
+    GenerateResponse, GenerateStream, ImageOptions, ModelProfile, OutputSpec, PartDelta,
+    ReasoningConfig, ReasoningEffort, StreamAccumulator, StreamEvent, TextFormat, ToolChoice,
+    collect_stream,
 };

@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{AgentState, Context, Metrics, ToolExecutor};
-use alaya_model::capability::{GenerateCapability, GenerateRequest};
+use alaya_model::capability::{GenerateCapability, GenerateConfig};
 
 pub use builder::AgentActorBuilder;
 pub use loop_control::LoopState;
@@ -29,8 +29,10 @@ where
     state: AgentState,
     /// 多模态生成模型
     model: Arc<M>,
-    /// 每次 step 使用的生成请求模板；messages 和 tools 会在调用前刷新。
-    request: GenerateRequest,
+    /// 目标逻辑模型名
+    model_name: String,
+    /// 可复用的生成配置（输出规范、采样参数、推理策略等）
+    generate_config: GenerateConfig,
     /// 工具执行器
     tool_executor: Arc<E>,
     /// 等待中的用户输入
@@ -43,13 +45,31 @@ where
     E: ToolExecutor + Send,
 {
     /// 创建新的 Agent Actor
-    pub fn new(model: M, request: GenerateRequest, tool_executor: E, context: Context) -> Self {
-        Self::with_runtime_hooks(model, request, tool_executor, context)
+    pub fn new(
+        model: M,
+        model_name: impl Into<String>,
+        tool_executor: E,
+        context: Context,
+    ) -> Self {
+        Self::with_runtime_hooks(
+            model,
+            model_name.into(),
+            GenerateConfig::default(),
+            tool_executor,
+            context,
+        )
+    }
+
+    /// 设置生成配置
+    pub fn with_generate_config(mut self, config: GenerateConfig) -> Self {
+        self.generate_config = config;
+        self
     }
 
     pub(crate) fn with_runtime_hooks(
         model: M,
-        request: GenerateRequest,
+        model_name: String,
+        generate_config: GenerateConfig,
         tool_executor: E,
         context: Context,
     ) -> Self {
@@ -67,7 +87,8 @@ where
                 metrics: Metrics::with_max_iterations(default_max_iterations),
             },
             model: Arc::new(model),
-            request,
+            model_name,
+            generate_config,
             tool_executor: Arc::new(tool_executor),
             pending_user_input: None,
         }
@@ -87,6 +108,14 @@ where
 
     pub fn context_mut(&mut self) -> &mut Context {
         &mut self.state.context
+    }
+
+    pub fn generate_config(&self) -> &GenerateConfig {
+        &self.generate_config
+    }
+
+    pub fn generate_config_mut(&mut self) -> &mut GenerateConfig {
+        &mut self.generate_config
     }
 
     async fn send_event(event_tx: Option<&mpsc::Sender<AgentActorEvent>>, event: AgentActorEvent) {

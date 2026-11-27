@@ -1,6 +1,6 @@
 use super::AgentActor;
 use crate::{Context, ToolExecutor};
-use alaya_model::capability::{GenerateCapability, GenerateRequest};
+use alaya_model::capability::{GenerateCapability, GenerateConfig};
 
 /// Agent Actor 构建器
 pub struct AgentActorBuilder<M, E>
@@ -9,7 +9,8 @@ where
     E: ToolExecutor + Send + 'static,
 {
     model: M,
-    request: GenerateRequest,
+    model_name: String,
+    generate_config: GenerateConfig,
     tool_executor: E,
     context: Context,
     max_iterations: usize,
@@ -21,15 +22,21 @@ where
     M: GenerateCapability + Send + Sync + 'static,
     E: ToolExecutor + Send + 'static,
 {
-    pub fn new(model: M, request: GenerateRequest, tool_executor: E) -> Self {
+    pub fn new(model: M, model_name: impl Into<String>, tool_executor: E) -> Self {
         Self {
             model,
-            request,
+            model_name: model_name.into(),
+            generate_config: GenerateConfig::default(),
             tool_executor,
             context: Context::new(),
             max_iterations: 10,
             user_id: "default".to_string(),
         }
+    }
+
+    pub fn generate_config(mut self, config: GenerateConfig) -> Self {
+        self.generate_config = config;
+        self
     }
 
     pub fn context(mut self, context: Context) -> Self {
@@ -50,7 +57,8 @@ where
     pub fn build(self) -> AgentActor<M, E> {
         let mut actor = AgentActor::with_runtime_hooks(
             self.model,
-            self.request,
+            self.model_name,
+            self.generate_config,
             self.tool_executor,
             self.context,
         );

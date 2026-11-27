@@ -72,7 +72,7 @@
 | 层 | 模块 | 形态 | 知道什么 | 不知道什么 |
 |----|------|------|----------|------------|
 | 分发层 | `router` | `ModelRouter` | 逻辑模型名 → 上游模型名 / `ModelProfile` / 适配器与主备 | 协议细节 |
-| 能力层 | `capability` | **trait** | 统一域接口 `GenerateCapability`、`GenerateRequest`、`GenerateResponse`、`StreamEvent`、`ModelProfile`、`ModelError` | HTTP、JSON 形状 |
+| 能力层 | `capability` | **trait** | 统一域接口 `GenerateCapability`、`GenerateRequest`、`GenerateConfig`、`OutputSpec`、`GenerateResponse`、`StreamEvent`、`ModelProfile`、`ModelError` | HTTP、JSON 形状 |
 | 协议层 | `protocols` | 适配器 | 端点路径、wire 结构体、厂商字段与模态编码 | 模型路由、`base_url` |
 | 厂商 | `providers` | **值** | `base_url`、默认请求头、`Auth`（Bearer / Header / Query / 动态签名） | 端点路径、wire 形状、路由 |
 | 传输层 | `transport` | **trait** | 连接、超时、代理、完整 SSE 分帧（`event/data/id`）、原始字节流 | 厂商、密钥、业务操作 |
@@ -175,18 +175,20 @@ router.register(
 
 // 生图：统一返回 ContentPart::Image(MediaSource)
 let image_resp = router
-    .generate(
-        GenerateRequest::image("black-forest-labs/flux.2-klein-4b", "日落下的山峦")
-            .with_image_options(ImageOptions::new().with_aspect_ratio("16:9").with_resolution("1K")),
-    )
+    .generate(GenerateRequest::image_with(
+        "black-forest-labs/flux.2-klein-4b",
+        "日落下的山峦",
+        ImageOptions::new().with_aspect_ratio("16:9").with_resolution("1K"),
+    ))
     .await?;
 
 // 生音：统一返回 ContentPart::Audio(MediaSource + transcript)
 let audio_resp = router
-    .generate(
-        GenerateRequest::audio("google/lyria-3-clip-preview", "一段轻快的钢琴循环")
-            .with_audio_options(AudioOptions::new().with_format("wav")),
-    )
+    .generate(GenerateRequest::audio_with(
+        "google/lyria-3-clip-preview",
+        "一段轻快的钢琴循环",
+        AudioOptions::new().with_format("wav"),
+    ))
     .await?;
 ```
 
@@ -202,7 +204,7 @@ let audio_resp = router
 | Crate | 模块 | 说明 |
 |-------|------|------|
 | `alaya-model` | `message` / `usage` | 统一多模态域 IR：`Message`、`MessageRole`、`Modality`、`ContentPart`、`MediaSource`、`ToolDef`、`ToolCall`、`Usage` |
-| `alaya-model` | `capability` | 统一能力层：`GenerateCapability`、`GenerateRequest`、`GenerateResponse`、`StreamEvent`、`StreamAccumulator`、`ModelProfile`、`ModelError` |
+| `alaya-model` | `capability` | 统一能力层：`GenerateCapability`、`GenerateRequest`、`GenerateConfig`、`OutputSpec`、`GenerateResponse`、`StreamEvent`、`StreamAccumulator`、`ModelProfile`、`ModelError` |
 | `alaya-model` | `protocols` | 协议层：`OpenAiCompatible`、`OpenRouterImages` |
 | `alaya-model` | `endpoints` | 端点预设：`openai_compatible`、`deepseek`、`openrouter` |
 | `alaya-model` | `providers` | 厂商身份：`Provider`、`Auth`、`RequestAuth` |

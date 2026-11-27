@@ -20,7 +20,9 @@ use crate::message::{
 };
 use crate::providers::Provider;
 
-use wire::{WireChatRequest, WireResponse, WireStreamResponse, WireToolCall};
+use wire::{
+    WireChatRequest, WireResponse, WireStreamOptions, WireStreamResponse, WireToolCall,
+};
 
 const CHAT_PATH: &str = "/chat/completions";
 
@@ -124,7 +126,7 @@ impl GenerateCapability for OpenAiCompatible {
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
         // OpenAI / OpenRouter 的 chat 音频输出端点要求流式接收 audio delta，
         // 这里在协议层内部透明走流并聚合成完整 GenerateResponse。
-        if request.output_modalities.contains(&Modality::Audio) {
+        if request.config.wants_output(Modality::Audio) {
             let mut response = collect_stream(self.generate_stream(request).await?).await?;
             if response.message.content.is_empty() {
                 return Err(ModelError::NoResponse);
@@ -136,8 +138,8 @@ impl GenerateCapability for OpenAiCompatible {
         }
 
         let default_audio_format = request
-            .audio_options
-            .as_ref()
+            .config
+            .audio_options()
             .and_then(|o| o.format.clone())
             .unwrap_or_else(|| "wav".to_string());
         let wire = WireChatRequest::try_from(&request)?;
@@ -162,12 +164,21 @@ impl GenerateCapability for OpenAiCompatible {
         request: GenerateRequest,
     ) -> Result<GenerateStream, ModelError> {
         let default_audio_format = request
-            .audio_options
-            .as_ref()
+            .config
+            .audio_options()
             .and_then(|o| o.format.clone())
             .unwrap_or_else(|| "wav".to_string());
         let mut wire = WireChatRequest::try_from(&request)?;
         wire.stream = Some(true);
+        let has_custom_stream_options = wire
+            .extra
+            .as_ref()
+            .is_some_and(|map| map.contains_key("stream_options"));
+        if !has_custom_stream_options {
+            wire.stream_options = Some(WireStreamOptions {
+                include_usage: true,
+            });
+        }
 
         let mut events = self.provider.post_sse(CHAT_PATH, &wire).await?;
 

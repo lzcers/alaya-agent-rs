@@ -202,7 +202,7 @@ mod tests {
     #[async_trait]
     impl GenerateCapability for StubModel {
         async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
-            let message = if request.output_modalities.contains(&Modality::Image) {
+            let message = if request.config.wants_output(Modality::Image) {
                 Message::assistant_parts(vec![ContentPart::image(MediaSource::url(format!(
                     "{}:{}",
                     self.tag, request.model

@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use tracing::warn;
 
 use crate::capability::{
-    GenerateRequest, ModelError, ReasoningConfig, ResponseFormat, ToolChoice,
+    GenerateRequest, ModelError, ReasoningConfig, TextFormat, ToolChoice,
 };
 use crate::message::{
     ContentPart, MediaSource, Message, MessageRole, Modality, ToolCall, mime_to_audio_format,
@@ -517,6 +517,7 @@ impl TryFrom<&GenerateRequest> for WireChatRequest {
     type Error = ModelError;
 
     fn try_from(request: &GenerateRequest) -> Result<Self, Self::Error> {
+        let config = &request.config;
         let messages = wire_messages_from_domain(&request.messages)?;
 
         let tools = request.tools.as_ref().map(|defs| {
@@ -532,7 +533,7 @@ impl TryFrom<&GenerateRequest> for WireChatRequest {
                 .collect()
         });
 
-        let tool_choice = request.tool_choice.as_ref().map(|choice| match choice {
+        let tool_choice = config.tool_choice.as_ref().map(|choice| match choice {
             ToolChoice::Auto => WireToolChoice::Mode("auto"),
             ToolChoice::None => WireToolChoice::Mode("none"),
             ToolChoice::Required => WireToolChoice::Mode("required"),
@@ -542,14 +543,14 @@ impl TryFrom<&GenerateRequest> for WireChatRequest {
             },
         });
 
-        let response_format = match &request.response_format {
-            ResponseFormat::Text => None,
-            ResponseFormat::JsonObject => Some(WireResponseFormat::JsonObject),
-            ResponseFormat::JsonSchema {
+        let response_format = match config.text_format() {
+            None | Some(TextFormat::Plain) => None,
+            Some(TextFormat::JsonObject) => Some(WireResponseFormat::JsonObject),
+            Some(TextFormat::JsonSchema {
                 name,
                 schema,
                 strict,
-            } => Some(WireResponseFormat::JsonSchema {
+            }) => Some(WireResponseFormat::JsonSchema {
                 json_schema: WireJsonSchema {
                     name: name.clone(),
                     schema: schema.clone(),
@@ -558,7 +559,7 @@ impl TryFrom<&GenerateRequest> for WireChatRequest {
             }),
         };
 
-        let (reasoning_effort, thinking) = match request.reasoning {
+        let (reasoning_effort, thinking) = match config.reasoning {
             ReasoningConfig::Default => (None, None),
             ReasoningConfig::Disabled => (
                 None,
@@ -575,22 +576,18 @@ impl TryFrom<&GenerateRequest> for WireChatRequest {
             ReasoningConfig::Effort { level } => (Some(level.as_str().to_string()), None),
         };
 
-        let stream_options = request
-            .include_usage
-            .then_some(WireStreamOptions { include_usage: true });
-
-        let is_plain_text = request.output_modalities.is_empty()
-            || request.output_modalities == [Modality::Text];
+        let output_modalities = request.output_modalities();
+        let is_plain_text = output_modalities == [Modality::Text];
 
         let mut modalities = None;
         let mut audio = None;
         if !is_plain_text {
             let mut wire_modalities = Vec::new();
-            let wants_audio = request.output_modalities.contains(&Modality::Audio);
-            if wants_audio && !request.output_modalities.contains(&Modality::Text) {
+            let wants_audio = output_modalities.contains(&Modality::Audio);
+            if wants_audio && !output_modalities.contains(&Modality::Text) {
                 wire_modalities.push("text".to_string());
             }
-            for modality in &request.output_modalities {
+            for modality in &output_modalities {
                 let name = match modality {
                     Modality::Text => "text",
                     Modality::Image => "image",
@@ -608,17 +605,16 @@ impl TryFrom<&GenerateRequest> for WireChatRequest {
             modalities = Some(wire_modalities);
 
             if wants_audio {
-                let format = request
-                    .audio_options
-                    .as_ref()
+                let format = config
+                    .audio_options()
                     .and_then(|o| o.format.clone())
                     .unwrap_or_else(|| "wav".to_string());
-                let voice = request.audio_options.as_ref().and_then(|o| o.voice.clone());
+                let voice = config.audio_options().and_then(|o| o.voice.clone());
                 audio = Some(WireAudioConfig { format, voice });
             }
         }
 
-        let extra = match &request.provider_options {
+        let extra = match &config.provider_options {
             None => None,
             Some(Value::Object(map)) => Some(map.clone()),
             Some(_) => {
@@ -632,16 +628,16 @@ impl TryFrom<&GenerateRequest> for WireChatRequest {
             model: request.model.clone(),
             messages,
             stream: None,
-            temperature: request.temperature,
-            top_p: request.top_p,
-            max_tokens: request.max_tokens,
-            stop: request.stop_sequences.clone(),
+            temperature: config.temperature,
+            top_p: config.top_p,
+            max_tokens: config.max_tokens,
+            stop: config.stop_sequences.clone(),
             tools,
             tool_choice,
             response_format,
             reasoning_effort,
             thinking,
-            stream_options,
+            stream_options: None,
             modalities,
             audio,
             extra,
@@ -1090,11 +1086,10 @@ mod tests {
         let request = GenerateRequest::new("deepseek-v4-pro", vec![Message::user("hello")])
             .with_temperature(0.25)
             .with_max_tokens(128)
-            .with_response_format(ResponseFormat::JsonObject)
+            .with_output(crate::capability::OutputSpec::json_object())
             .with_reasoning(ReasoningConfig::Effort {
                 level: ReasoningEffort::High,
             })
-            .with_stream_usage(true)
             .with_tools(Some(vec![crate::message::ToolDef {
                 name: "read_file".to_string(),
                 description: "read".to_string(),
@@ -1108,10 +1103,10 @@ mod tests {
         assert_eq!(wire["max_tokens"], 128);
         assert_eq!(wire["response_format"]["type"], "json_object");
         assert_eq!(wire["reasoning_effort"], "high");
-        assert_eq!(wire["stream_options"]["include_usage"], true);
         assert_eq!(wire["tools"][0]["type"], "function");
         assert_eq!(wire["tools"][0]["function"]["name"], "read_file");
         assert!(wire.get("stream").is_none());
+        assert!(wire.get("stream_options").is_none());
         assert!(wire.get("modalities").is_none());
     }
 }

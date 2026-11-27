@@ -11,7 +11,7 @@ use crate::capability::{
     FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream,
     ModelError, StreamEvent,
 };
-use crate::message::{ContentPart, Message, MessageRole, Modality};
+use crate::message::{ContentPart, Message, MessageRole};
 use crate::providers::Provider;
 
 use wire::{WireImageRequest, generated_image_to_source};
@@ -46,26 +46,21 @@ fn extract_prompt(request: &GenerateRequest) -> Option<String> {
 #[async_trait]
 impl GenerateCapability for OpenRouterImages {
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
-        if !request.output_modalities.contains(&Modality::Image) {
+        let Some(opts) = request.config.image_options().cloned() else {
             return Err(ModelError::Unsupported(
                 "OpenRouterImages only supports `image` output modality".to_string(),
             ));
-        }
+        };
 
         let prompt = extract_prompt(&request)
             .ok_or_else(|| ModelError::InvalidRequest("image prompt must not be empty".into()))?;
-
-        let (resolution, aspect_ratio) = match request.image_options {
-            Some(opts) => (opts.resolution, opts.aspect_ratio),
-            None => (None, None),
-        };
 
         let model = request.model.clone();
         let wire = WireImageRequest {
             model: request.model,
             prompt,
-            resolution,
-            aspect_ratio,
+            resolution: opts.resolution,
+            aspect_ratio: opts.aspect_ratio,
         };
         let response: wire::WireImageResponse = self.provider.post_json(IMAGES_PATH, &wire).await?;
         let parts: Vec<ContentPart> = response
@@ -125,14 +120,13 @@ mod tests {
         let model = OpenRouterImages::new(fake_provider(transport.clone()));
 
         let response = model
-            .generate(
-                GenerateRequest::image("krea/krea-2-medium-turbo", "cinematic landscape")
-                    .with_image_options(
-                        ImageOptions::new()
-                            .with_resolution("1K")
-                            .with_aspect_ratio("16:9"),
-                    ),
-            )
+            .generate(GenerateRequest::image_with(
+                "krea/krea-2-medium-turbo",
+                "cinematic landscape",
+                ImageOptions::new()
+                    .with_resolution("1K")
+                    .with_aspect_ratio("16:9"),
+            ))
             .await
             .unwrap();
 

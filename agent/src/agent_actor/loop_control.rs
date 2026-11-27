@@ -41,7 +41,8 @@ where
         let lifecycle_flow = lifecycle
             .start(
                 model.as_ref(),
-                &self.request,
+                &self.model_name,
+                &self.generate_config,
                 tool_executor.as_ref(),
                 event_tx.as_ref(),
             )
