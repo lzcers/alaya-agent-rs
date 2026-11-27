@@ -8,8 +8,6 @@ pub mod filesystem;
 pub mod hooks;
 pub mod memory;
 pub mod select;
-#[cfg(test)]
-mod tests;
 pub mod tools;
 
 pub use agent_actor::{

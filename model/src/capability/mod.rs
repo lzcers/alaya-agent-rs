@@ -7,11 +7,16 @@
 
 mod error;
 mod generate;
+mod request;
+mod response;
 
 pub use error::{ModelError, format_model_error};
-pub use generate::{
-    AudioOptions, FinishReason, GenerateCapability, GenerateConfig, GenerateRequest,
-    GenerateResponse, GenerateStream, ImageOptions, ModelProfile, OutputSpec, PartDelta,
-    ReasoningConfig, ReasoningEffort, StreamAccumulator, StreamEvent, TextFormat, ToolChoice,
+pub use generate::{GenerateCapability, ModelProfile};
+pub use request::{
+    AudioOptions, GenerateConfig, GenerateRequest, ImageOptions, OutputSpec, ReasoningConfig,
+    ReasoningEffort, TextFormat, ToolChoice,
+};
+pub use response::{
+    FinishReason, GenerateResponse, GenerateStream, PartDelta, StreamAccumulator, StreamEvent,
     collect_stream,
 };

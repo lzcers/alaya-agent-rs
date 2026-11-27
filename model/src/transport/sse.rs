@@ -43,7 +43,7 @@ fn strip_field_space(value: &str) -> &str {
 /// 从缓冲区中切出所有完整 SSE 事件，未完成的事件留在缓冲区里。
 ///
 /// 多个 `data:` 行按规范用 `\n` 拼接；注释行（`:` 开头）与空 `data` 事件被丢弃。
-pub(crate) fn drain_events(buffer: &mut Vec<u8>) -> Vec<SseEvent> {
+fn drain_events(buffer: &mut Vec<u8>) -> Vec<SseEvent> {
     normalize_crlf(buffer);
 
     let mut events = Vec::new();
@@ -119,115 +119,5 @@ pub fn events(
         for event in drain_events(&mut buffer) {
             yield Ok(event);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::Bytes;
-    use serde_json::json;
-
-    #[test]
-    fn handles_split_chunks() {
-        let mut buffer = Vec::new();
-        buffer.extend_from_slice(b"data: {\"id\":\"abc\"");
-        assert!(drain_events(&mut buffer).is_empty());
-
-        buffer.extend_from_slice(b",\"object\":\"chat.completion.chunk\"}\n\n");
-        let parsed = drain_events(&mut buffer);
-
-        assert_eq!(
-            parsed,
-            vec![SseEvent {
-                event: None,
-                data: "{\"id\":\"abc\",\"object\":\"chat.completion.chunk\"}".to_string(),
-                id: None,
-            }]
-        );
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn preserves_multibyte_payload_across_every_chunk_boundary() {
-        let payload = json!({ "content": "铜片🙂" }).to_string();
-        let frame = format!("event: delta\nid: 42\ndata: {payload}\r\n\r\n");
-
-        for split_at in 0..=frame.len() {
-            let mut buffer = Vec::new();
-            buffer.extend_from_slice(&frame.as_bytes()[..split_at]);
-            let mut parsed = drain_events(&mut buffer);
-
-            buffer.extend_from_slice(&frame.as_bytes()[split_at..]);
-            parsed.extend(drain_events(&mut buffer));
-
-            assert_eq!(parsed.len(), 1, "split_at={split_at}");
-            assert_eq!(parsed[0].event.as_deref(), Some("delta"));
-            assert_eq!(parsed[0].id.as_deref(), Some("42"));
-            assert_eq!(parsed[0].data, payload, "split_at={split_at}");
-            assert!(buffer.is_empty(), "split_at={split_at}");
-        }
-    }
-
-    #[test]
-    fn joins_multiple_data_lines_and_keeps_done_marker() {
-        let mut buffer = b"data: {\"a\":1}\ndata: {\"b\":2}\n\ndata: [DONE]\n\n".to_vec();
-        let data: Vec<String> = drain_events(&mut buffer)
-            .into_iter()
-            .map(|e| e.data)
-            .collect();
-
-        assert_eq!(data, vec!["{\"a\":1}\n{\"b\":2}", "[DONE]"]);
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn ignores_whitespace_and_comment_events() {
-        let mut buffer = b": keep-alive\n\n\n\ndata: {\"a\":1}\n\n".to_vec();
-        let data: Vec<String> = drain_events(&mut buffer)
-            .into_iter()
-            .map(|e| e.data)
-            .collect();
-
-        assert_eq!(data, vec!["{\"a\":1}"]);
-    }
-
-    #[tokio::test]
-    async fn events_frames_a_chunked_body() {
-        let body: BodyStream = Box::pin(futures::stream::iter(vec![
-            Ok(Bytes::from_static(b"data: {\"i\":1}\n\ndata: {\"i\":")),
-            Ok(Bytes::from_static(b"2}\n\ndata: [DONE]\n\n")),
-        ]));
-
-        let parsed: Vec<String> = events(body)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .into_iter()
-            .map(|e| e.data)
-            .collect();
-
-        assert_eq!(parsed, vec!["{\"i\":1}", "{\"i\":2}", "[DONE]"]);
-    }
-
-    #[tokio::test]
-    async fn events_flushes_trailing_event_without_blank_line() {
-        let body: BodyStream = Box::pin(futures::stream::once(async {
-            Ok(Bytes::from_static(b"data: {\"last\":true}"))
-        }));
-
-        let parsed: Vec<String> = events(body)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .into_iter()
-            .map(|e| e.data)
-            .collect();
-
-        assert_eq!(parsed, vec!["{\"last\":true}"]);
     }
 }

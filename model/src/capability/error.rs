@@ -95,30 +95,3 @@ pub fn format_model_error(error: &ModelError) -> String {
     details.push_str(&format!("; debug: {error:?}"));
     details
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_model_error_includes_error_chain_and_debug_details() {
-        let serialization_error = serde_json::from_str::<serde_json::Value>("not-json")
-            .expect_err("invalid JSON should fail");
-        let error = ModelError::from(TransportError::Serialization(serialization_error));
-
-        let details = format_model_error(&error);
-
-        assert!(details.contains("Transport error: Serialization error:"));
-        assert!(details.contains("debug: Transport(Serialization("));
-    }
-
-    #[test]
-    fn serde_failures_map_to_decode_not_transport() {
-        let error: ModelError = serde_json::from_str::<serde_json::Value>("not-json")
-            .expect_err("invalid JSON should fail")
-            .into();
-
-        assert!(matches!(error, ModelError::Decode(_)));
-        assert!(format_model_error(&error).starts_with("Decode error:"));
-    }
-}

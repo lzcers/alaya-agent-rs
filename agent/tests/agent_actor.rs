@@ -1,9 +1,10 @@
-use crate::tools::playwright_cli::PlaywrightCliTool;
-use crate::{
+use std::sync::Arc;
+
+use alaya_agent::tools::playwright_cli::PlaywrightCliTool;
+use alaya_agent::{
     AgentActor, AgentActorEvent, AgentTerminalReason, Context, GenericToolExecutor, StepResult,
     Tool, ToolCall, ToolDef, ToolExecutorError,
 };
-
 use alaya_model::capability::{
     FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream,
     ModelError, ModelProfile, PartDelta, StreamEvent,
@@ -14,7 +15,6 @@ use alaya_model::{ContentPart, Message, Usage};
 use async_trait::async_trait;
 use futures::stream;
 use serde_json::{Value, json};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 fn print_test_banner(title: &str) {
@@ -363,7 +363,7 @@ async fn test_agent_actor_accumulates_usage_from_stream_response() {
     let mut actor = AgentActor::new(model, "mock-model", executor, context);
     let result = actor.run_step(None).await;
 
-    assert!(matches!(result, crate::StepResult::Done { .. }));
+    assert!(matches!(result, StepResult::Done { .. }));
     assert_eq!(actor.state().metrics.tokens.input_tokens, 13);
     assert_eq!(actor.state().metrics.tokens.output_tokens, 8);
     assert_eq!(actor.state().metrics.tokens.total_tokens, 21);
@@ -405,7 +405,7 @@ async fn test_agent_actor_emits_step_frame_metrics_to_upper_layer() {
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let result = actor.run_step(Some(event_tx)).await;
 
-    assert!(matches!(result, crate::StepResult::Continue { .. }));
+    assert!(matches!(result, StepResult::Continue { .. }));
     assert_eq!(actor.state().metrics.execution.iteration, 1);
     assert_eq!(actor.state().metrics.tools.call_count, 1);
     assert_eq!(actor.state().metrics.tools.success_count, 1);
@@ -450,7 +450,7 @@ async fn test_agent_actor_records_error_metrics_when_max_iterations_exceeded() {
 
     let result = actor.run_step(None).await;
 
-    assert!(matches!(result, crate::StepResult::Error(_)));
+    assert!(matches!(result, StepResult::Error(_)));
     assert_eq!(actor.state().metrics.execution.iteration, 0);
     assert_eq!(
         actor.state().metrics.execution.terminal_reason,

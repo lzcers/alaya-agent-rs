@@ -1,13 +1,12 @@
 use std::fs;
 
-use serde_json::json;
-use tempfile::tempdir;
-
-use crate::select::{
+use alaya_agent::select::{
     FileSelector, FindRequest, GrepRequest, ListDirRequest, ReadFileRequest, SelectConfig,
     SelectToolConfig, register_select_tools,
 };
-use crate::{FsSelector, GenericToolExecutor, ToolCall, ToolExecutor};
+use alaya_agent::{FsSelector, GenericToolExecutor, ToolCall, ToolExecutor};
+use serde_json::json;
+use tempfile::tempdir;
 
 #[test]
 fn fs_selector_supports_list_find_grep_and_read() {

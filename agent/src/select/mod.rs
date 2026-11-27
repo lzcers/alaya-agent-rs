@@ -1,6 +1,4 @@
 mod selector;
-#[cfg(test)]
-mod tests;
 mod tools;
 mod types;
 

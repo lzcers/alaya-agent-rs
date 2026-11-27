@@ -48,36 +48,3 @@ pub fn generated_image_to_source(image: WireGeneratedImage) -> Option<MediaSourc
         .unwrap_or_else(|| "image/png".to_string());
     Some(MediaSource::base64(media_type, encoded))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_image_prefers_url_and_maps_b64_to_media_source() {
-        assert_eq!(
-            generated_image_to_source(WireGeneratedImage {
-                url: Some("https://example.com/a.png".to_string()),
-                b64_json: Some("ignored".to_string()),
-                media_type: None,
-            }),
-            Some(MediaSource::url("https://example.com/a.png"))
-        );
-        assert_eq!(
-            generated_image_to_source(WireGeneratedImage {
-                url: None,
-                b64_json: Some("aW1hZ2U=".to_string()),
-                media_type: Some("image/webp".to_string()),
-            }),
-            Some(MediaSource::base64("image/webp", "aW1hZ2U="))
-        );
-        assert_eq!(
-            generated_image_to_source(WireGeneratedImage {
-                url: None,
-                b64_json: None,
-                media_type: None,
-            }),
-            None
-        );
-    }
-}

@@ -1,6 +1,4 @@
 mod store;
-#[cfg(test)]
-mod tests;
 mod tools;
 mod types;
 

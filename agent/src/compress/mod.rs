@@ -32,6 +32,3 @@ impl Context {
         summary::compress_by_model(self, model, options).await
     }
 }
-
-#[cfg(test)]
-mod tests;
