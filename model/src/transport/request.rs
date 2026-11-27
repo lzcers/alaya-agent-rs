@@ -52,16 +52,6 @@ impl HttpRequest {
         Ok(self)
     }
 
-    /// 追加一个 query 参数（兼容 URL 已有 `?` 的场景）。
-    pub fn with_query(mut self, key: &str, value: impl AsRef<str>) -> Self {
-        let sep = if self.url.contains('?') { '&' } else { '?' };
-        self.url.push(sep);
-        self.url.push_str(key);
-        self.url.push('=');
-        self.url.push_str(value.as_ref());
-        self
-    }
-
     /// 用 JSON 作为请求体，并带上 `Content-Type`。
     pub fn with_json_body<T: Serialize + ?Sized>(
         mut self,
@@ -75,6 +65,7 @@ impl HttpRequest {
     }
 
     /// 用原始字节作为请求体。二进制上传（音频、文件）走这里。
+    #[cfg(test)]
     pub fn with_bytes_body(
         mut self,
         content_type: &str,
@@ -117,6 +108,7 @@ impl HttpResponse {
     }
 
     /// 用一段已知字节构造响应（测试替身与内部复用）。
+    #[cfg(test)]
     pub fn buffered(status: u16, body: impl Into<Bytes>) -> Self {
         let body = body.into();
         Self {

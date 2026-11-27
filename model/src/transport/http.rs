@@ -28,6 +28,7 @@ pub trait Transport: Send + Sync {
 #[derive(Clone)]
 pub struct HttpTransport {
     client: reqwest::Client,
+    #[cfg(test)]
     timeout: Duration,
     proxy_url: Option<String>,
 }
@@ -43,12 +44,14 @@ impl HttpTransport {
         let timeout = Duration::from_secs(120);
         Self {
             client: build_http_client(timeout, None),
+            #[cfg(test)]
             timeout,
             proxy_url: None,
         }
     }
 
     /// 设置请求超时时间
+    #[cfg(test)]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self.client = build_http_client(self.timeout, self.proxy_url.as_deref());
@@ -56,16 +59,19 @@ impl HttpTransport {
     }
 
     /// 设置请求代理
+    #[cfg(test)]
     pub fn with_proxy(mut self, proxy_url: impl Into<String>) -> Self {
         self.proxy_url = Some(proxy_url.into());
         self.client = build_http_client(self.timeout, self.proxy_url.as_deref());
         self
     }
 
+    #[cfg(test)]
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
 
+    #[cfg(test)]
     pub fn proxy_url(&self) -> Option<&str> {
         self.proxy_url.as_deref()
     }

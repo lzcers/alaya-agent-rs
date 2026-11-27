@@ -29,7 +29,4 @@ pub enum TransportError {
     /// 响应流中途中断
     #[error("Stream error: {0}")]
     Stream(String),
-    /// 缺少 API 密钥
-    #[error("Missing API key")]
-    MissingApiKey,
 }

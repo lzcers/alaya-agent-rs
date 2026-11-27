@@ -1,17 +1,13 @@
-use std::sync::Arc;
-
 use alaya_agent::tools::playwright_cli::PlaywrightCliTool;
 use alaya_agent::{
     AgentActor, AgentActorEvent, AgentTerminalReason, Context, GenericToolExecutor, StepResult,
     Tool, ToolCall, ToolDef, ToolExecutorError,
 };
-use alaya_model::capability::{
-    FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream,
-    ModelError, ModelProfile, PartDelta, StreamEvent,
-};
 use alaya_model::endpoints::deepseek_from_env;
-use alaya_model::router::ModelRouter;
-use alaya_model::{ContentPart, Message, Usage};
+use alaya_model::{
+    ContentPart, FinishReason, GenerateCapability, GenerateRequest, GenerateResponse,
+    GenerateStream, Message, ModelError, ModelProfile, ModelRouter, PartDelta, StreamEvent, Usage,
+};
 use async_trait::async_trait;
 use futures::stream;
 use serde_json::{Value, json};
@@ -149,7 +145,7 @@ async fn test_agent_actor_with_deepseek_and_playwright() {
     print_test_banner("AgentActor DeepSeek + Playwright Test");
 
     let provider = match deepseek_from_env() {
-        Ok(p) => Arc::new(p),
+        Ok(p) => p,
         Err(_) => {
             print_section("Skipped");
             print_field("reason", "未设置 DEEPSEEK_API_KEY 环境变量");

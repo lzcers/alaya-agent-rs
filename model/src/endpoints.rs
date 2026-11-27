@@ -1,7 +1,6 @@
-//! 端点预设：把「哪个 `base_url` + 哪些请求头 + 认证」组装成可注册的 [`GenerateCapability`] 实现。
+//! 端点预设：把「`base_url` + 请求头 + 认证 + 协议」组装成可直接使用的 [`GenerateCapability`]。
 //!
-//! 这里是组合根，没有协议知识（协议在 [`crate::protocols`]），也没有字节搬运
-//! （传输在 [`crate::transport`]）——只有厂商的地址、认证与协议选择。
+//! 对上层只暴露统一的能力句柄 `Arc<dyn GenerateCapability>`，隐藏底层协议适配器与传输细节。
 
 use std::env;
 use std::sync::{Arc, OnceLock};
@@ -13,7 +12,7 @@ use crate::capability::{
 };
 use crate::protocols::{OpenAiCompatible, OpenRouterImages};
 use crate::providers::Provider;
-use crate::transport::{HttpTransport, Transport, TransportError};
+use crate::transport::{HttpTransport, Transport};
 
 /// 目录函数共用的默认传输。
 fn shared_transport() -> Arc<dyn Transport> {
@@ -27,11 +26,7 @@ fn shared_transport() -> Arc<dyn Transport> {
 // 通用：任何 OpenAI 兼容厂商
 // ============================================================================
 
-/// 声明一个 OpenAI 兼容的厂商端点。
-///
-/// 接入一个兼容 OpenAI 的新厂商，只需要这一行：给个名字、key 和 `base_url`。
-/// **不需要实现任何 trait**——协议复用 [`OpenAiCompatible`]，传输复用 [`HttpTransport`]。
-pub fn openai_compatible(
+pub(crate) fn build_openai_compatible(
     name: impl Into<String>,
     api_key: impl Into<String>,
     base_url: impl Into<String>,
@@ -40,22 +35,37 @@ pub fn openai_compatible(
     OpenAiCompatible::new(provider)
 }
 
+/// 声明一个 OpenAI 兼容的厂商端点。
+///
+/// 接入兼容 OpenAI 的新厂商只需要名字、API Key 和 `base_url`。
+pub fn openai_compatible(
+    name: impl Into<String>,
+    api_key: impl Into<String>,
+    base_url: impl Into<String>,
+) -> Arc<dyn GenerateCapability> {
+    Arc::new(build_openai_compatible(name, api_key, base_url))
+}
+
 // ============================================================================
 // DeepSeek
 // ============================================================================
 
-/// DeepSeek 端点。
-pub fn deepseek(api_key: impl Into<String>) -> OpenAiCompatible {
+pub(crate) fn build_deepseek(api_key: impl Into<String>) -> OpenAiCompatible {
     let base_url =
         env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com".to_string());
-    openai_compatible("deepseek", api_key, base_url)
+    build_openai_compatible("deepseek", api_key, base_url)
+}
+
+/// DeepSeek 端点。
+pub fn deepseek(api_key: impl Into<String>) -> Arc<dyn GenerateCapability> {
+    Arc::new(build_deepseek(api_key))
 }
 
 /// 从环境变量创建 DeepSeek 端点。
 ///
-/// 环境变量: DEEPSEEK_API_KEY (必需), DEEPSEEK_BASE_URL (可选)
-pub fn deepseek_from_env() -> Result<OpenAiCompatible, TransportError> {
-    let api_key = env::var("DEEPSEEK_API_KEY").map_err(|_| TransportError::MissingApiKey)?;
+/// 环境变量: `DEEPSEEK_API_KEY` (必需), `DEEPSEEK_BASE_URL` (可选)
+pub fn deepseek_from_env() -> Result<Arc<dyn GenerateCapability>, ModelError> {
+    let api_key = env::var("DEEPSEEK_API_KEY").map_err(|_| ModelError::MissingApiKey)?;
     Ok(deepseek(api_key))
 }
 
@@ -67,24 +77,26 @@ pub fn deepseek_from_env() -> Result<OpenAiCompatible, TransportError> {
 ///
 /// 文本/视觉/音频/多模态对话走 OpenAI 兼容协议，纯图片生成请求走 OpenRouter 自有的
 /// `/images` 端点；两个适配器共享同一个 [`Provider`]，对外暴露为同一个 [`GenerateCapability`]。
-pub struct OpenRouter {
+pub(crate) struct OpenRouter {
     chat: OpenAiCompatible,
     images: OpenRouterImages,
 }
 
 impl OpenRouter {
-    pub fn new(provider: Provider) -> Self {
+    pub(crate) fn new(provider: Provider) -> Self {
         Self {
             chat: OpenAiCompatible::new(provider.clone()),
             images: OpenRouterImages::new(provider),
         }
     }
 
-    pub fn chat_adapter(&self) -> &OpenAiCompatible {
+    #[cfg(test)]
+    pub(crate) fn chat_adapter(&self) -> &OpenAiCompatible {
         &self.chat
     }
 
-    pub fn images_adapter(&self) -> &OpenRouterImages {
+    #[cfg(test)]
+    pub(crate) fn images_adapter(&self) -> &OpenRouterImages {
         &self.images
     }
 
@@ -93,13 +105,7 @@ impl OpenRouter {
     }
 }
 
-/// 创建 OpenRouter 端点。
-pub fn openrouter(api_key: impl Into<String>) -> OpenRouter {
-    openrouter_with_config(api_key, None, None)
-}
-
-/// 创建 OpenRouter 端点（带额外请求头配置）。
-pub fn openrouter_with_config(
+pub(crate) fn build_openrouter(
     api_key: impl Into<String>,
     http_referer: Option<String>,
     x_title: Option<String>,
@@ -119,9 +125,25 @@ pub fn openrouter_with_config(
     OpenRouter::new(provider)
 }
 
+/// 创建 OpenRouter 端点。
+pub fn openrouter(api_key: impl Into<String>) -> Arc<dyn GenerateCapability> {
+    openrouter_with_config(api_key, None, None)
+}
+
+/// 创建 OpenRouter 端点（带额外请求头配置）。
+pub fn openrouter_with_config(
+    api_key: impl Into<String>,
+    http_referer: Option<String>,
+    x_title: Option<String>,
+) -> Arc<dyn GenerateCapability> {
+    Arc::new(build_openrouter(api_key, http_referer, x_title))
+}
+
 /// 从环境变量创建 OpenRouter 端点。
-pub fn openrouter_from_env() -> Result<OpenRouter, TransportError> {
-    let api_key = env::var("OPENROUTER_API_KEY").map_err(|_| TransportError::MissingApiKey)?;
+///
+/// 环境变量: `OPENROUTER_API_KEY` (必需), `OPENROUTER_BASE_URL` / `OPENROUTER_HTTP_REFERER` / `OPENROUTER_X_TITLE` (可选)
+pub fn openrouter_from_env() -> Result<Arc<dyn GenerateCapability>, ModelError> {
+    let api_key = env::var("OPENROUTER_API_KEY").map_err(|_| ModelError::MissingApiKey)?;
     let http_referer = env::var("OPENROUTER_HTTP_REFERER").ok();
     let x_title = env::var("OPENROUTER_X_TITLE").ok();
     Ok(openrouter_with_config(api_key, http_referer, x_title))

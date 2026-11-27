@@ -3,10 +3,10 @@ use alaya_agent::compress::{
     ModelCompression, RuleCompression, SummaryModel,
 };
 use alaya_agent::{Context, FsMemoryStore, Layer, LayerKind, MemoryConfig, MemoryStore, ToolCall};
-use alaya_model::capability::{
-    FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream, ModelError,
+use alaya_model::{
+    ContentPart, FinishReason, GenerateCapability, GenerateRequest, GenerateResponse,
+    GenerateStream, Message, MessageRole, ModelError,
 };
-use alaya_model::{ContentPart, Message, MessageRole};
 use async_trait::async_trait;
 use futures::stream;
 use serde_json::{Value, json};

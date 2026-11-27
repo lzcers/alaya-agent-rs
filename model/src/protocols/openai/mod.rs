@@ -34,6 +34,7 @@ impl OpenAiCompatible {
         Self { provider }
     }
 
+    #[cfg(test)]
     pub fn provider(&self) -> &Provider {
         &self.provider
     }

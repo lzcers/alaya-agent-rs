@@ -8,7 +8,6 @@ use super::conversation::{
 };
 use super::{CompressionError, ConversationRule, LayerAction, RuleCompression};
 use crate::{Context, Layer, MemoryError, MemoryStore};
-use alaya_model::message::render_display_text;
 use alaya_model::{ContentPart, Message, MessageRole};
 
 const TOOL_RESULT_CLEARED: &str = "[Tool result cleared]";
@@ -139,7 +138,7 @@ fn compress_conversation_messages(
                             is_error,
                         } => {
                             cleared_tool_count += 1;
-                            let archived_text = render_display_text(&content);
+                            let archived_text = ContentPart::render_display_text(&content);
                             let placeholder = if let Some(store) = memory.as_deref_mut() {
                                 let archive_path = archive_tool_result(
                                     store,

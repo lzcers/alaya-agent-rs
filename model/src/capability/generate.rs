@@ -1,5 +1,7 @@
 //! 统一的多模态生成能力契约与模型能力画像。
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::capability::{GenerateRequest, GenerateResponse, GenerateStream, ModelError};
@@ -153,4 +155,18 @@ pub trait GenerateCapability: Send + Sync {
         &self,
         request: GenerateRequest,
     ) -> Result<GenerateStream, ModelError>;
+}
+
+#[async_trait]
+impl<T: GenerateCapability + ?Sized> GenerateCapability for Arc<T> {
+    async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
+        (**self).generate(request).await
+    }
+
+    async fn generate_stream(
+        &self,
+        request: GenerateRequest,
+    ) -> Result<GenerateStream, ModelError> {
+        (**self).generate_stream(request).await
+    }
 }

@@ -4,17 +4,15 @@
 //! 共享同一套 [`ContentPart`] 模型，统一表达输入与输出的文本、图片、音频、视频、文件、
 //! 推理过程（含签名透传）、工具调用与多模态工具结果。
 
-pub mod content;
-pub mod tool;
+mod content;
+mod tool;
 
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-pub use content::{
-    ContentPart, MediaSource, Modality, audio_format_to_mime, extract_text, mime_to_audio_format,
-    render_display_text,
-};
+pub use content::{ContentPart, MediaSource, Modality};
+pub(crate) use content::{audio_format_to_mime, extract_text, mime_to_audio_format};
 pub use tool::{ToolCall, ToolDef};
 
 /// 消息角色。
@@ -102,7 +100,7 @@ impl Message {
 
     /// 渲染用于日志、展示或摘要的文本视图（非文本模态用 `[image]` 等占位）。
     pub fn display_text(&self) -> String {
-        render_display_text(&self.content)
+        ContentPart::render_display_text(&self.content)
     }
 
     /// 提取推理内容文本（如果包含非空 `Reasoning` 块）。

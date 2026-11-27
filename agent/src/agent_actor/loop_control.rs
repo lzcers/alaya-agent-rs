@@ -6,8 +6,7 @@ use super::lifecycle::{LifeCycleFlow, LifeCycleInterrupt, LifeCycleResult, StepL
 use super::{AgentActor, AgentActorCommand, AgentActorEvent, AgentActorHandle, StepResult};
 use crate::agent_actor::lifecycle::StepFrame;
 use crate::{AgentError, AgentTerminalReason, JobState, ToolExecutor};
-use alaya_model::capability::GenerateCapability;
-use alaya_model::{ContentPart, Message};
+use alaya_model::{ContentPart, GenerateCapability, Message};
 
 #[derive(Clone)]
 pub enum LoopState {

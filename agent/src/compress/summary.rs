@@ -5,7 +5,6 @@ use super::conversation::{
 };
 use super::{CompressionError, ModelCompression, SummaryModel};
 use crate::{Context, Layer, LayerKind};
-use alaya_model::message::render_display_text;
 use alaya_model::{ContentPart, Message, MessageRole};
 
 const DEFAULT_SUMMARIZE_INSTRUCTION: &str = "Preserve key decisions, constraints, pending work, and unresolved questions. Discard repetitive exploration and raw tool output unless it changes the state of the task.";
@@ -138,7 +137,7 @@ fn transcript_lines(message: &Message) -> Vec<String> {
                     ..
                 } = part
                 {
-                    let text = render_display_text(content);
+                    let text = ContentPart::render_display_text(content);
                     if text.trim().is_empty() {
                         continue;
                     }

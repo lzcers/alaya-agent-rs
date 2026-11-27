@@ -282,10 +282,38 @@ impl ContentPart {
             }
         }
     }
+
+    /// 把内容块切片渲染为可读文本视图。
+    pub fn render_display_text(parts: &[ContentPart]) -> String {
+        let mut segments: Vec<String> = Vec::new();
+        for part in parts {
+            match part {
+                ContentPart::Text { text } if !text.is_empty() => segments.push(text.clone()),
+                ContentPart::Image { .. } => segments.push("[image]".to_string()),
+                ContentPart::Audio { transcript, .. } => match transcript.as_deref() {
+                    Some(t) if !t.trim().is_empty() => segments.push(format!("[audio: {t}]")),
+                    _ => segments.push("[audio]".to_string()),
+                },
+                ContentPart::Video { .. } => segments.push("[video]".to_string()),
+                ContentPart::File { filename, .. } => match filename.as_deref() {
+                    Some(name) if !name.is_empty() => segments.push(format!("[file: {name}]")),
+                    _ => segments.push("[file]".to_string()),
+                },
+                ContentPart::ToolResult { content, .. } => {
+                    let inner = Self::render_display_text(content);
+                    if !inner.is_empty() {
+                        segments.push(inner);
+                    }
+                }
+                _ => {}
+            }
+        }
+        segments.join("\n")
+    }
 }
 
 /// 音频短格式名（如 `wav` / `mp3`）到 MIME 类型的映射。
-pub fn audio_format_to_mime(format: &str) -> String {
+pub(crate) fn audio_format_to_mime(format: &str) -> String {
     match format.to_ascii_lowercase().as_str() {
         "wav" => "audio/wav".to_string(),
         "mp3" | "mpeg" => "audio/mpeg".to_string(),
@@ -300,7 +328,7 @@ pub fn audio_format_to_mime(format: &str) -> String {
 }
 
 /// MIME 类型到短音频格式名（如 `audio/mpeg` → `mp3`）的映射。
-pub fn mime_to_audio_format(media_type: &str) -> &str {
+pub(crate) fn mime_to_audio_format(media_type: &str) -> &str {
     match media_type {
         "audio/wav" | "audio/x-wav" => "wav",
         "audio/mpeg" | "audio/mp3" => "mp3",
@@ -314,7 +342,7 @@ pub fn mime_to_audio_format(media_type: &str) -> &str {
 }
 
 /// 从内容块切片提取纯文本（遇到 `ToolResult` 会展开其内部文本）。
-pub fn extract_text(parts: &[ContentPart]) -> Cow<'_, str> {
+pub(crate) fn extract_text(parts: &[ContentPart]) -> Cow<'_, str> {
     let mut texts: Vec<&str> = Vec::new();
     collect_texts(parts, &mut texts);
     match texts.as_slice() {
@@ -332,32 +360,4 @@ fn collect_texts<'a>(parts: &'a [ContentPart], out: &mut Vec<&'a str>) {
             _ => {}
         }
     }
-}
-
-/// 把内容块切片渲染为可读文本视图。
-pub fn render_display_text(parts: &[ContentPart]) -> String {
-    let mut segments: Vec<String> = Vec::new();
-    for part in parts {
-        match part {
-            ContentPart::Text { text } if !text.is_empty() => segments.push(text.clone()),
-            ContentPart::Image { .. } => segments.push("[image]".to_string()),
-            ContentPart::Audio { transcript, .. } => match transcript.as_deref() {
-                Some(t) if !t.trim().is_empty() => segments.push(format!("[audio: {t}]")),
-                _ => segments.push("[audio]".to_string()),
-            },
-            ContentPart::Video { .. } => segments.push("[video]".to_string()),
-            ContentPart::File { filename, .. } => match filename.as_deref() {
-                Some(name) if !name.is_empty() => segments.push(format!("[file: {name}]")),
-                _ => segments.push("[file]".to_string()),
-            },
-            ContentPart::ToolResult { content, .. } => {
-                let inner = render_display_text(content);
-                if !inner.is_empty() {
-                    segments.push(inner);
-                }
-            }
-            _ => {}
-        }
-    }
-    segments.join("\n")
 }

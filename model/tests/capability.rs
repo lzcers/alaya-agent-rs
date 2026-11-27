@@ -1,9 +1,7 @@
-use alaya_model::capability::{
-    GenerateRequest, ImageOptions, ModelError, OutputSpec, ReasoningConfig, ReasoningEffort,
-    TextFormat, format_model_error,
+use alaya_model::{
+    GenerateRequest, ImageOptions, Modality, ModelError, OutputSpec, ReasoningConfig,
+    ReasoningEffort, TextFormat, ToolDef,
 };
-use alaya_model::transport::TransportError;
-use alaya_model::{Modality, ToolDef};
 use serde_json::json;
 
 #[test]
@@ -54,23 +52,31 @@ fn tools_stay_domain_typed() {
 }
 
 #[test]
-fn format_model_error_includes_error_chain_and_debug_details() {
-    let serialization_error = serde_json::from_str::<serde_json::Value>("not-json")
-        .expect_err("invalid JSON should fail");
-    let error = ModelError::from(TransportError::Serialization(serialization_error));
+fn model_error_detailed_includes_display_and_debug() {
+    let error = ModelError::Decode("invalid json".to_string());
+    let details = error.detailed();
 
-    let details = format_model_error(&error);
-
-    assert!(details.contains("Transport error: Serialization error:"));
-    assert!(details.contains("debug: Transport(Serialization("));
+    assert!(details.starts_with("Decode error: invalid json"));
+    assert!(details.contains("debug: Decode("));
 }
 
 #[test]
-fn serde_failures_map_to_decode_not_transport() {
-    let error: ModelError = serde_json::from_str::<serde_json::Value>("not-json")
-        .expect_err("invalid JSON should fail")
-        .into();
-
-    assert!(matches!(error, ModelError::Decode(_)));
-    assert!(format_model_error(&error).starts_with("Decode error:"));
+fn retryable_error_classification_covers_transient_failures() {
+    assert!(ModelError::Network("timeout".into()).is_retryable());
+    assert!(
+        ModelError::Api {
+            status: 503,
+            message: "unavailable".into()
+        }
+        .is_retryable()
+    );
+    assert!(
+        ModelError::RateLimited {
+            message: "slow down".into(),
+            retry_after: None
+        }
+        .is_retryable()
+    );
+    assert!(!ModelError::Auth("bad key".into()).is_retryable());
+    assert!(!ModelError::MissingApiKey.is_retryable());
 }

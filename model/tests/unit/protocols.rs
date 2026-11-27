@@ -1,19 +1,19 @@
 use std::sync::{Arc, Mutex};
 
-use alaya_model::capability::{
-    FinishReason, GenerateCapability, GenerateRequest, ImageOptions, ModelError, OutputSpec,
-    PartDelta, ReasoningConfig, ReasoningEffort, StreamEvent, collect_stream,
-};
-use alaya_model::protocols::openai::types::{
+use crate::protocols::openai::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChoiceMessage, ChunkDelta,
     ToolCall as OpenAiToolCall, ToolCallFunction,
 };
-use alaya_model::protocols::openrouter::generated_image_to_source;
-use alaya_model::protocols::openrouter::types::GeneratedImage;
-use alaya_model::protocols::{OpenAiCompatible, OpenRouterImages};
-use alaya_model::providers::Provider;
-use alaya_model::transport::{HttpRequest, HttpResponse, Transport, TransportError};
-use alaya_model::{ContentPart, MediaSource, Message, ToolCall, ToolDef};
+use crate::protocols::openrouter::generated_image_to_source;
+use crate::protocols::openrouter::types::GeneratedImage;
+use crate::protocols::{OpenAiCompatible, OpenRouterImages};
+use crate::providers::Provider;
+use crate::transport::{HttpRequest, HttpResponse, Transport, TransportError};
+use crate::{
+    ContentPart, FinishReason, GenerateCapability, GenerateRequest, ImageOptions, MediaSource,
+    Message, ModelError, OutputSpec, PartDelta, ReasoningConfig, ReasoningEffort, StreamEvent,
+    ToolCall, ToolDef, collect_stream,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;

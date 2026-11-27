@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use alaya_model::transport::{BodyStream, HttpRequest, HttpResponse, HttpTransport, SseEvent, Transport, sse};
+use crate::transport::{BodyStream, HttpRequest, HttpResponse, HttpTransport, SseEvent, Transport, sse};
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::header::CONTENT_TYPE;

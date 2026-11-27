@@ -5,29 +5,21 @@
 //!   - **自有协议**：实现 **1 个 [`GenerateCapability`] trait**；认证方案由 `Provider` 承担，
 //!     **不需要自定义传输层**
 
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderMap};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
 
-use alaya_model::capability::{
-    FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream,
-    ModelError, ModelProfile, PartDelta, StreamEvent,
+use crate::endpoints::openai_compatible;
+use crate::providers::Provider;
+use crate::transport::{HttpRequest, HttpResponse, Transport, TransportError};
+use crate::{
+    FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream, Message,
+    Modality, ModelError, ModelProfile, ModelRouter, PartDelta, StreamEvent,
 };
-use alaya_model::endpoints::openai_compatible;
-use alaya_model::providers::Provider;
-use alaya_model::router::ModelRouter;
-use alaya_model::transport::{HttpRequest, HttpResponse, Transport, TransportError};
-use alaya_model::{Message, Modality};
-
-// ────────────────────────────────────────────────────────────────────────────
-// 场景一：自有协议的厂商
-//
-// Acme 的 wire 字段与 OpenAI 完全不同（`engine` / `prompt` / `max_new_tokens`），
-// 认证用 `x-acme-key`。
-// ────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
 struct AcmeRequest<'a> {
@@ -65,8 +57,8 @@ struct AcmeModel {
 #[async_trait]
 impl GenerateCapability for AcmeModel {
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError> {
-        let wire = AcmeRequest::from(&request);
-        let response: AcmeResponse = self.provider.post_json("/v1/generate", &wire).await?;
+        let body = AcmeRequest::from(&request);
+        let response: AcmeResponse = self.provider.post_json("/v1/generate", &body).await?;
         let output = response
             .outputs
             .into_iter()
@@ -86,8 +78,8 @@ impl GenerateCapability for AcmeModel {
         &self,
         request: GenerateRequest,
     ) -> Result<GenerateStream, ModelError> {
-        let wire = AcmeRequest::from(&request);
-        let mut events = self.provider.post_sse("/v1/generate:stream", &wire).await?;
+        let body = AcmeRequest::from(&request);
+        let mut events = self.provider.post_sse("/v1/generate:stream", &body).await?;
 
         let stream = async_stream::stream! {
             while let Some(item) = events.next().await {
@@ -175,7 +167,6 @@ async fn a_custom_protocol_vendor_needs_one_capability_trait() {
         Arc::new(AcmeModel { provider }),
     );
 
-    // 非流式
     let response = router
         .generate(GenerateRequest::new(
             "acme-large",
@@ -185,7 +176,6 @@ async fn a_custom_protocol_vendor_needs_one_capability_trait() {
         .expect("generate should succeed");
     assert_eq!(response.message, Message::assistant("hello from acme"));
 
-    // 流式
     let events: Vec<StreamEvent> = router
         .generate_stream(GenerateRequest::new(
             "acme-large",
@@ -222,17 +212,9 @@ async fn a_custom_protocol_vendor_needs_one_capability_trait() {
     assert!(seen[0].headers.get(AUTHORIZATION).is_none());
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// 场景二：兼容 OpenAI 的厂商，一行接入，零 trait 实现
-// ────────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn an_openai_compatible_vendor_needs_zero_trait_implementations() {
-    let model = Arc::new(openai_compatible(
-        "groq",
-        "dummy-key",
-        "https://api.groq.com/openai/v1",
-    ));
+    let model = openai_compatible("groq", "dummy-key", "https://api.groq.com/openai/v1");
 
     let mut router = ModelRouter::new();
     router.register(
@@ -240,11 +222,7 @@ fn an_openai_compatible_vendor_needs_zero_trait_implementations() {
         ModelProfile::text(),
         model.clone(),
     );
-    router.register(
-        "some-audio-model",
-        ModelProfile::audio_generation(),
-        model,
-    );
+    router.register("some-audio-model", ModelProfile::audio_generation(), model);
 
     assert!(router.supports_output("llama-3.3-70b-versatile", Modality::Text));
     assert!(router.supports_output("some-audio-model", Modality::Audio));

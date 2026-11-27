@@ -1,6 +1,6 @@
 use super::AgentActor;
 use crate::{Context, ToolExecutor};
-use alaya_model::capability::{GenerateCapability, GenerateConfig};
+use alaya_model::{GenerateCapability, GenerateConfig};
 
 /// Agent Actor 构建器
 pub struct AgentActorBuilder<M, E>

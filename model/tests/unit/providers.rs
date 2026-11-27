@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use alaya_model::providers::Provider;
-use alaya_model::transport::{HttpRequest, HttpResponse, Transport, TransportError};
+use crate::ModelError;
+use crate::providers::Provider;
+use crate::transport::{HttpRequest, HttpResponse, Transport, TransportError};
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Method;
@@ -162,4 +163,26 @@ async fn post_sse_frames_events_from_the_response_body() {
         transport.seen()[0].headers.get(ACCEPT).unwrap(),
         "text/event-stream"
     );
+}
+
+#[test]
+fn transport_errors_map_into_domain_model_errors() {
+    let serialization_error =
+        serde_json::from_str::<Value>("not-json").expect_err("invalid JSON should fail");
+    let decode = ModelError::from(TransportError::Serialization(serialization_error));
+    assert!(matches!(decode, ModelError::Decode(_)));
+
+    let auth = ModelError::from(TransportError::Api {
+        status: 401,
+        message: "bad key".into(),
+        retry_after: None,
+    });
+    assert!(matches!(auth, ModelError::Auth(msg) if msg == "bad key"));
+
+    let limited = ModelError::from(TransportError::Api {
+        status: 429,
+        message: "slow down".into(),
+        retry_after: None,
+    });
+    assert!(matches!(limited, ModelError::RateLimited { .. }));
 }

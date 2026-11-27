@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
-use alaya_model::capability::{
-    FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream,
-    ModelError, ModelProfile,
-};
 use alaya_model::endpoints::{deepseek, openrouter};
-use alaya_model::router::ModelRouter;
-use alaya_model::{ContentPart, MediaSource, Message, Modality};
+use alaya_model::{
+    ContentPart, FinishReason, GenerateCapability, GenerateRequest, GenerateResponse,
+    GenerateStream, MediaSource, Message, Modality, ModelError, ModelProfile, ModelRouter,
+};
 use async_trait::async_trait;
 use futures::stream;
 
@@ -97,12 +95,12 @@ fn registration_is_keyed_by_model_and_profile() {
     router.register_many(
         &["deepseek-chat", "deepseek-reasoner"],
         ModelProfile::text(),
-        Arc::new(deepseek("dummy_key")),
+        deepseek("dummy_key"),
     );
     router.register(
         "black-forest-labs/flux.2-klein-4b",
         ModelProfile::image_generation(),
-        Arc::new(openrouter("dummy_key")),
+        openrouter("dummy_key"),
     );
 
     assert!(router.supports_output("deepseek-chat", Modality::Text));

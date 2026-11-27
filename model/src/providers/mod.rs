@@ -1,15 +1,12 @@
 //! 厂商身份：一个端点就是「传输 + 地址 + 请求头 + 认证」。
 //!
 //! [`Provider`] 是**值**不是 trait——厂商之间变化的东西几乎全是数据
-//! （`base_url`、认证方案、额外请求头），动态签名（如 AWS SigV4 / OAuth2 刷新）
-//! 通过 [`Auth::Custom`] 注入，而不需要把整个厂商抽象成 trait。
-//!
-//! 它自己不实现任何能力；能力由 [`crate::protocols`] 的适配器在它之上实现。
+//! （`base_url`、认证方案、额外请求头）。它自己不实现任何能力；
+//! 能力由 [`crate::protocols`] 的适配器在它之上实现。
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use futures::stream::BoxStream;
 use reqwest::header::RETRY_AFTER;
 use serde::Serialize;
@@ -22,12 +19,6 @@ use crate::transport::{HttpRequest, HttpResponse, SseEvent, Transport, Transport
 /// SSE 事件流。
 pub type SseStream = BoxStream<'static, Result<SseEvent, TransportError>>;
 
-/// 动态请求认证/签名钩子（如 AWS SigV4、OAuth2 Token 刷新）。
-#[async_trait]
-pub trait RequestAuth: Send + Sync {
-    async fn apply(&self, request: &mut HttpRequest) -> Result<(), TransportError>;
-}
-
 /// 厂商认证方案。
 #[derive(Clone, Default)]
 pub enum Auth {
@@ -35,18 +26,15 @@ pub enum Auth {
     None,
     /// `Authorization: Bearer <token>`
     Bearer(String),
-    /// 自定义请求头（如 Anthropic `x-api-key`、Azure `api-key`）
+    /// 自定义请求头（如 `x-api-key`）
+    #[cfg(test)]
     Header { name: String, value: String },
-    /// Query 参数认证（如 Gemini `?key=...`）
-    QueryParam { name: String, value: String },
-    /// 动态按请求签名或刷新令牌
-    Custom(Arc<dyn RequestAuth>),
 }
 
 /// 一个厂商端点。
 ///
 /// 持有四样东西：怎么发（[`Transport`]）、发给谁（`base_url`）、默认头（`headers`）、
-/// 以及怎么证明身份（[`Auth`]）。它不知道路径、wire 形状和业务语义。
+/// 以及怎么证明身份（[`Auth`]）。它不知道路径、协议形状和业务语义。
 #[derive(Clone)]
 pub struct Provider {
     transport: Arc<dyn Transport>,
@@ -79,26 +67,12 @@ impl Provider {
     }
 
     /// 用自定义请求头认证（如 `x-api-key`）。
+    #[cfg(test)]
     pub fn with_header_auth(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.auth = Auth::Header {
             name: name.into(),
             value: value.into(),
         };
-        self
-    }
-
-    /// 用 query 参数认证（如 `?key=...`）。
-    pub fn with_query_auth(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.auth = Auth::QueryParam {
-            name: name.into(),
-            value: value.into(),
-        };
-        self
-    }
-
-    /// 设置任意认证方案（含动态签名 [`Auth::Custom`]）。
-    pub fn with_auth(mut self, auth: Auth) -> Self {
-        self.auth = auth;
         self
     }
 
@@ -118,18 +92,17 @@ impl Provider {
         self
     }
 
+    #[cfg(test)]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    #[cfg(test)]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
-    pub fn headers(&self) -> &[(String, String)] {
-        &self.headers
-    }
-
+    #[cfg(test)]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -137,17 +110,7 @@ impl Provider {
             .map(|(_, v)| v.as_str())
     }
 
-    pub fn auth(&self) -> &Auth {
-        &self.auth
-    }
-
-    pub fn transport(&self) -> &Arc<dyn Transport> {
-        &self.transport
-    }
-
     /// 拼出一个指向该端点的请求（已带厂商默认请求头，保留 `base_url` 与 `path` 的 query 参数）。
-    ///
-    /// 这是唯一的通用出口：二进制上传、multipart、非 JSON 响应都从这里出发。
     pub fn request(
         &self,
         method: reqwest::Method,
@@ -162,7 +125,7 @@ impl Provider {
 
     /// 应用认证并发送请求。
     pub async fn send(&self, mut request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        apply_auth(&self.auth, &mut request).await?;
+        apply_auth(&self.auth, &mut request)?;
         info!(
             provider = %self.name,
             method = %request.method,
@@ -202,7 +165,7 @@ impl Provider {
     }
 }
 
-async fn apply_auth(auth: &Auth, request: &mut HttpRequest) -> Result<(), TransportError> {
+fn apply_auth(auth: &Auth, request: &mut HttpRequest) -> Result<(), TransportError> {
     match auth {
         Auth::None => Ok(()),
         Auth::Bearer(token) => {
@@ -212,23 +175,17 @@ async fn apply_auth(auth: &Auth, request: &mut HttpRequest) -> Result<(), Transp
             *request = updated;
             Ok(())
         }
+        #[cfg(test)]
         Auth::Header { name, value } => {
-            let updated = std::mem::replace(request, HttpRequest::post(""))
-                .with_header(name, value)?;
-            *request = updated;
-            Ok(())
-        }
-        Auth::QueryParam { name, value } => {
             let updated =
-                std::mem::replace(request, HttpRequest::post("")).with_query(name, value);
+                std::mem::replace(request, HttpRequest::post("")).with_header(name, value)?;
             *request = updated;
             Ok(())
         }
-        Auth::Custom(signer) => signer.apply(request).await,
     }
 }
 
-/// 拼接 `base_url` 与相对 `path`，同时保留两边的 query 参数（支持 Azure `api-version`、Gemini `alt=sse` 等）。
+/// 拼接 `base_url` 与相对 `path`，同时保留两边的 query 参数。
 fn join_url(base_url: &str, path: &str) -> String {
     let (base_path, base_query) = base_url.split_once('?').unwrap_or((base_url, ""));
     let (rel_path, rel_query) = path.split_once('?').unwrap_or((path, ""));
@@ -265,7 +222,7 @@ fn join_url(base_url: &str, path: &str) -> String {
 }
 
 /// 非 2xx 在这里变成错误；错误消息从常见信封里尽力提取，同时解析 `Retry-After`。
-pub async fn ensure_success(response: HttpResponse) -> Result<HttpResponse, TransportError> {
+async fn ensure_success(response: HttpResponse) -> Result<HttpResponse, TransportError> {
     if response.is_success() {
         return Ok(response);
     }
@@ -286,9 +243,6 @@ pub async fn ensure_success(response: HttpResponse) -> Result<HttpResponse, Tran
 }
 
 /// 尽力从错误响应体里取出一条人类可读的消息。
-///
-/// 不绑定任何具体厂商的信封格式：`error.message`、`message`、`error` 字符串，
-/// 都没有就原样返回。
 fn extract_error_message(body: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return body.to_string();

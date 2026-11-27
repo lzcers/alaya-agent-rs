@@ -3,7 +3,7 @@ use crate::{
     agent_actor::lifecycle::{LifeCycle, LifeCycleFlow, LifeCycleResult},
     hooks::{HookName, LifeCycleContext, LifeCycleHook},
 };
-use alaya_model::capability::{PartDelta, StreamEvent};
+use alaya_model::{PartDelta, StreamEvent};
 
 pub struct SendModelEvtHook;
 

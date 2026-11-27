@@ -13,11 +13,10 @@ use crate::hooks::metrics::MetricsHook;
 use crate::hooks::send_model_evt::SendModelEvtHook;
 use crate::tools::execute_tools;
 use crate::{AgentState, ToolCall, ToolExecutor, ToolResult};
-use alaya_model::capability::{
-    FinishReason, GenerateCapability, GenerateConfig, GenerateRequest, StreamAccumulator,
-    StreamEvent, format_model_error,
+use alaya_model::{
+    FinishReason, GenerateCapability, GenerateConfig, GenerateRequest, Message, StreamAccumulator,
+    StreamEvent, Usage,
 };
-use alaya_model::{Message, Usage};
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub enum LifeCycle {
@@ -227,7 +226,7 @@ impl StepLifeCycle {
         let mut stream = match model.generate_stream(request).await {
             Ok(stream) => stream,
             Err(err) => {
-                return Self::break_step(LifeCycleInterrupt::model_error(format_model_error(&err)));
+                return Self::break_step(LifeCycleInterrupt::model_error(err.detailed()));
             }
         };
 
@@ -236,9 +235,7 @@ impl StepLifeCycle {
             let event = match item {
                 Ok(event) => event,
                 Err(err) => {
-                    return Self::break_step(LifeCycleInterrupt::model_error(format_model_error(
-                        &err,
-                    )));
+                    return Self::break_step(LifeCycleInterrupt::model_error(err.detailed()));
                 }
             };
             acc.push(&event);

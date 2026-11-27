@@ -5,8 +5,9 @@ use thiserror::Error;
 
 use crate::memory::MemoryError;
 use crate::{Layer, LayerKind};
-use alaya_model::capability::{GenerateCapability, GenerateConfig, GenerateRequest, ModelError};
-use alaya_model::{Message, MessageRole};
+use alaya_model::{
+    GenerateCapability, GenerateConfig, GenerateRequest, Message, MessageRole, ModelError,
+};
 
 #[async_trait]
 pub trait SummaryModel: Send + Sync {

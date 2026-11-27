@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{AgentState, Context, Metrics, ToolExecutor};
-use alaya_model::capability::{GenerateCapability, GenerateConfig};
+use alaya_model::{GenerateCapability, GenerateConfig};
 
 pub use builder::AgentActorBuilder;
 pub use loop_control::LoopState;

@@ -25,7 +25,7 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
-    pub fn from_wire(raw: &str) -> Self {
+    pub(crate) fn from_wire(raw: &str) -> Self {
         match raw {
             "stop" | "end_turn" | "stop_sequence" | "STOP" => Self::Stop,
             "length" | "max_tokens" | "MAX_TOKENS" => Self::Length,

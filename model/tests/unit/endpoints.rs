@@ -1,17 +1,17 @@
 use std::sync::{Arc, Mutex};
 
-use alaya_model::capability::{GenerateCapability, GenerateRequest};
-use alaya_model::endpoints::{OpenRouter, deepseek, openrouter, openrouter_with_config};
-use alaya_model::providers::Provider;
-use alaya_model::transport::{HttpRequest, HttpResponse, Transport, TransportError};
-use alaya_model::{MediaSource, Message};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::json;
 
+use crate::endpoints::{OpenRouter, build_deepseek, build_openrouter};
+use crate::providers::Provider;
+use crate::transport::{HttpRequest, HttpResponse, Transport, TransportError};
+use crate::{GenerateCapability, GenerateRequest, MediaSource, Message};
+
 #[test]
 fn deepseek_is_a_bare_openai_compatible_adapter() {
-    let model = deepseek("dummy-key");
+    let model = build_deepseek("dummy-key");
 
     assert_eq!(model.provider().name(), "deepseek");
     assert_eq!(model.provider().base_url(), "https://api.deepseek.com");
@@ -19,7 +19,7 @@ fn deepseek_is_a_bare_openai_compatible_adapter() {
 
 #[test]
 fn openrouter_is_composed_from_one_provider() {
-    let model = openrouter("dummy-key");
+    let model = build_openrouter("dummy-key", None, None);
 
     assert_eq!(model.chat_adapter().provider().name(), "openrouter");
     assert_eq!(model.images_adapter().provider().name(), "openrouter");
@@ -31,7 +31,7 @@ fn openrouter_is_composed_from_one_provider() {
 
 #[test]
 fn openrouter_config_headers_land_on_the_provider() {
-    let model = openrouter_with_config(
+    let model = build_openrouter(
         "dummy-key",
         Some("https://example.com".to_string()),
         Some("alaya".to_string()),
