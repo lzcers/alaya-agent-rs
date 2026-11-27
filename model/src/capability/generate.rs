@@ -90,7 +90,10 @@ impl ModelProfile {
         self
     }
 
-    pub fn with_output_modalities(mut self, modalities: impl IntoIterator<Item = Modality>) -> Self {
+    pub fn with_output_modalities(
+        mut self,
+        modalities: impl IntoIterator<Item = Modality>,
+    ) -> Self {
         self.output_modalities = modalities.into_iter().collect();
         self
     }
@@ -151,10 +154,8 @@ impl ModelProfile {
 pub trait GenerateCapability: Send + Sync {
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, ModelError>;
 
-    async fn generate_stream(
-        &self,
-        request: GenerateRequest,
-    ) -> Result<GenerateStream, ModelError>;
+    async fn generate_stream(&self, request: GenerateRequest)
+    -> Result<GenerateStream, ModelError>;
 }
 
 #[async_trait]
