@@ -5,7 +5,7 @@
 //!
 //! 这两个类型都是**纯域形状**：不含任何厂商私有字段。OpenAI 的嵌套
 //! `function.arguments` 字符串、流式增量里的 `index`、`type: "function"` 等
-//! 形状差异由协议层负责翻译（见 [`crate::protocols::openai::wire::WireToolCall`]）。
+//! 形状差异由协议层负责翻译（见 [`crate::protocols::openai::types::ToolCall`]）。
 //!
 //! 工具**执行**侧的类型（`Tool`、`ToolRegistry`、`GenericToolExecutor`、
 //! `ToolResult`）留在上层 `alaya-agent`——那才是编排层的职责。

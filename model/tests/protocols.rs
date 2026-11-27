@@ -4,11 +4,12 @@ use alaya_model::capability::{
     FinishReason, GenerateCapability, GenerateRequest, ImageOptions, ModelError, OutputSpec,
     PartDelta, ReasoningConfig, ReasoningEffort, StreamEvent, collect_stream,
 };
-use alaya_model::protocols::openai::wire::{
-    WireChatRequest, WireChoiceMessage, WireDelta, WireResponse, WireStreamResponse, WireToolCall,
-    WireToolCallFunction,
+use alaya_model::protocols::openai::types::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChoiceMessage, ChunkDelta,
+    ToolCall as OpenAiToolCall, ToolCallFunction,
 };
-use alaya_model::protocols::openrouter::wire::{WireGeneratedImage, generated_image_to_source};
+use alaya_model::protocols::openrouter::generated_image_to_source;
+use alaya_model::protocols::openrouter::types::GeneratedImage;
 use alaya_model::protocols::{OpenAiCompatible, OpenRouterImages};
 use alaya_model::providers::Provider;
 use alaya_model::transport::{HttpRequest, HttpResponse, Transport, TransportError};
@@ -341,33 +342,33 @@ async fn tools_are_encoded_into_wire_format() {
 }
 
 // ============================================================================
-// OpenAI wire types
+// OpenAI protocol types & conversion
 // ============================================================================
 
 #[test]
 fn tool_call_fragments_merge_by_index() {
-    let mut accumulated = WireToolCall {
+    let mut accumulated = OpenAiToolCall {
         id: "call_1".to_string(),
         call_type: Some("function".to_string()),
         index: Some(0),
-        function: Some(WireToolCallFunction {
+        function: Some(ToolCallFunction {
             name: "read_file".to_string(),
             arguments: String::new(),
         }),
         ..Default::default()
     };
 
-    let fragment_a = WireToolCall {
+    let fragment_a = OpenAiToolCall {
         index: Some(0),
-        function: Some(WireToolCallFunction {
+        function: Some(ToolCallFunction {
             name: String::new(),
             arguments: "{\"path\":".to_string(),
         }),
         ..Default::default()
     };
-    let fragment_b = WireToolCall {
+    let fragment_b = OpenAiToolCall {
         index: Some(0),
-        function: Some(WireToolCallFunction {
+        function: Some(ToolCallFunction {
             name: String::new(),
             arguments: "\"a.txt\"}".to_string(),
         }),
@@ -385,12 +386,12 @@ fn tool_call_fragments_merge_by_index() {
 }
 
 #[test]
-fn wire_tool_call_maps_to_domain_with_parsed_arguments() {
-    let call = WireToolCall {
+fn protocol_tool_call_maps_to_domain_with_parsed_arguments() {
+    let call = OpenAiToolCall {
         id: "call_1".to_string(),
         call_type: Some("function".to_string()),
         index: Some(0),
-        function: Some(WireToolCallFunction {
+        function: Some(ToolCallFunction {
             name: "read_file".to_string(),
             arguments: "{\"path\":\"a.txt\"}".to_string(),
         }),
@@ -399,7 +400,7 @@ fn wire_tool_call_maps_to_domain_with_parsed_arguments() {
     };
 
     assert_eq!(
-        call.into_domain(),
+        ToolCall::from(call),
         ToolCall {
             id: "call_1".to_string(),
             name: "read_file".to_string(),
@@ -410,33 +411,33 @@ fn wire_tool_call_maps_to_domain_with_parsed_arguments() {
 
 #[test]
 fn malformed_tool_arguments_fall_back_to_null() {
-    let call = WireToolCall {
+    let call = OpenAiToolCall {
         id: "call_1".to_string(),
-        function: Some(WireToolCallFunction {
+        function: Some(ToolCallFunction {
             name: "read_file".to_string(),
             arguments: "{\"path\":".to_string(),
         }),
         ..Default::default()
     };
 
-    assert_eq!(call.into_domain().arguments, Value::Null);
+    assert_eq!(ToolCall::from(call).arguments, Value::Null);
 }
 
 #[test]
-fn domain_tool_call_encodes_back_to_nested_wire_shape() {
+fn domain_tool_call_encodes_back_to_nested_protocol_shape() {
     let call = ToolCall {
         id: "call_1".to_string(),
         name: "read_file".to_string(),
         arguments: json!({ "path": "a.txt" }),
     };
 
-    let wire = serde_json::to_value(WireToolCall::from(&call)).unwrap();
+    let encoded = serde_json::to_value(OpenAiToolCall::from(&call)).unwrap();
 
-    assert_eq!(wire["id"], "call_1");
-    assert_eq!(wire["type"], "function");
-    assert_eq!(wire["function"]["name"], "read_file");
-    assert_eq!(wire["function"]["arguments"], "{\"path\":\"a.txt\"}");
-    assert!(wire.get("index").is_none());
+    assert_eq!(encoded["id"], "call_1");
+    assert_eq!(encoded["type"], "function");
+    assert_eq!(encoded["function"]["name"], "read_file");
+    assert_eq!(encoded["function"]["arguments"], "{\"path\":\"a.txt\"}");
+    assert!(encoded.get("index").is_none());
 }
 
 #[test]
@@ -444,12 +445,12 @@ fn reasoning_accepts_openrouter_and_deepseek_responses() {
     for field in ["reasoning", "reasoning_content"] {
         let mut message = json!({ "role": "assistant", "content": "answer" });
         message[field] = json!("reasoning text");
-        let full: WireChoiceMessage = serde_json::from_value(message.clone()).unwrap();
-        let delta: WireDelta = serde_json::from_value(message).unwrap();
+        let full: ChoiceMessage = serde_json::from_value(message.clone()).unwrap();
+        let delta: ChunkDelta = serde_json::from_value(message).unwrap();
         assert_eq!(full.reasoning_content.as_deref(), Some("reasoning text"));
         assert_eq!(delta.reasoning_content.as_deref(), Some("reasoning text"));
     }
-    let delta: WireDelta = serde_json::from_value(json!({"reasoning": null})).unwrap();
+    let delta: ChunkDelta = serde_json::from_value(json!({"reasoning": null})).unwrap();
     assert!(delta.reasoning_content.is_none());
 }
 
@@ -480,7 +481,7 @@ fn test_response_allows_null_content_for_images() {
         ]
     }"#;
 
-    let response: WireResponse = serde_json::from_str(body).unwrap();
+    let response: ChatCompletionResponse = serde_json::from_str(body).unwrap();
     let choice = response.choices.into_iter().next().unwrap();
 
     assert_eq!(choice.message.content, None);
@@ -524,7 +525,7 @@ fn test_response_allows_float_u32_fields() {
         }
     }"#;
 
-    let response: WireResponse = serde_json::from_str(body).unwrap();
+    let response: ChatCompletionResponse = serde_json::from_str(body).unwrap();
     let choice = response.choices.into_iter().next().unwrap();
     let usage = response.usage.unwrap();
 
@@ -558,7 +559,7 @@ fn test_stream_response_allows_audio_delta() {
         ]
     }"#;
 
-    let response: WireStreamResponse = serde_json::from_str(body).unwrap();
+    let response: ChatCompletionChunk = serde_json::from_str(body).unwrap();
     let audio = response.choices[0].delta.audio.as_ref().unwrap();
 
     assert_eq!(audio.data.as_deref(), Some("YWJj"));
@@ -566,7 +567,7 @@ fn test_stream_response_allows_audio_delta() {
 }
 
 #[test]
-fn generate_request_maps_domain_fields_to_wire_body() {
+fn generate_request_maps_domain_fields_to_chat_completion_request() {
     let request = GenerateRequest::new("deepseek-v4-pro", vec![Message::user("hello")])
         .with_temperature(0.25)
         .with_max_tokens(128)
@@ -580,22 +581,22 @@ fn generate_request_maps_domain_fields_to_wire_body() {
             parameters: json!({ "type": "object" }),
         }]));
 
-    let wire = serde_json::to_value(WireChatRequest::try_from(&request).unwrap()).unwrap();
+    let body = serde_json::to_value(ChatCompletionRequest::try_from(&request).unwrap()).unwrap();
 
-    assert_eq!(wire["model"], "deepseek-v4-pro");
-    assert_eq!(wire["temperature"], 0.25);
-    assert_eq!(wire["max_tokens"], 128);
-    assert_eq!(wire["response_format"]["type"], "json_object");
-    assert_eq!(wire["reasoning_effort"], "high");
-    assert_eq!(wire["tools"][0]["type"], "function");
-    assert_eq!(wire["tools"][0]["function"]["name"], "read_file");
-    assert!(wire.get("stream").is_none());
-    assert!(wire.get("stream_options").is_none());
-    assert!(wire.get("modalities").is_none());
+    assert_eq!(body["model"], "deepseek-v4-pro");
+    assert_eq!(body["temperature"], 0.25);
+    assert_eq!(body["max_tokens"], 128);
+    assert_eq!(body["response_format"]["type"], "json_object");
+    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+    assert!(body.get("stream").is_none());
+    assert!(body.get("stream_options").is_none());
+    assert!(body.get("modalities").is_none());
 }
 
 // ============================================================================
-// OpenRouter image protocol & wire
+// OpenRouter image protocol & types
 // ============================================================================
 
 #[tokio::test]
@@ -647,7 +648,7 @@ async fn generate_rejects_empty_prompt_without_calling_transport() {
 #[test]
 fn generated_image_prefers_url_and_maps_b64_to_media_source() {
     assert_eq!(
-        generated_image_to_source(WireGeneratedImage {
+        generated_image_to_source(GeneratedImage {
             url: Some("https://example.com/a.png".to_string()),
             b64_json: Some("ignored".to_string()),
             media_type: None,
@@ -655,7 +656,7 @@ fn generated_image_prefers_url_and_maps_b64_to_media_source() {
         Some(MediaSource::url("https://example.com/a.png"))
     );
     assert_eq!(
-        generated_image_to_source(WireGeneratedImage {
+        generated_image_to_source(GeneratedImage {
             url: None,
             b64_json: Some("aW1hZ2U=".to_string()),
             media_type: Some("image/webp".to_string()),
@@ -663,7 +664,7 @@ fn generated_image_prefers_url_and_maps_b64_to_media_source() {
         Some(MediaSource::base64("image/webp", "aW1hZ2U="))
     );
     assert_eq!(
-        generated_image_to_source(WireGeneratedImage {
+        generated_image_to_source(GeneratedImage {
             url: None,
             b64_json: None,
             media_type: None,

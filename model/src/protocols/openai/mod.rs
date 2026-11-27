@@ -1,10 +1,10 @@
 //! OpenAI 兼容协议适配器（覆盖文本对话、推理、工具、图文输入以及 chat 端点上的多模态输出）。
 //!
-//! 这是唯一知道 `/chat/completions` 与相关 wire 结构体的地方，也是
-//! wire ↔ 域类型映射的落点。它持有一个 [`Provider`]（厂商身份），
-//! 地址与认证由对方负责，本层只管形状。
+//! 协议本身的数据结构定义在 [`types`]，域 ↔ 协议映射在内部 `convert` 模块，
+//! 本文件负责 HTTP/SSE 调用以及为 [`OpenAiCompatible`] 实现 [`GenerateCapability`]。
 
-pub mod wire;
+mod convert;
+pub mod types;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -15,13 +15,11 @@ use crate::capability::{
     FinishReason, GenerateCapability, GenerateRequest, GenerateResponse, GenerateStream,
     ModelError, PartDelta, StreamEvent, collect_stream,
 };
-use crate::message::{
-    ContentPart, MediaSource, Message, MessageRole, Modality, audio_format_to_mime,
-};
+use crate::message::{ContentPart, Modality};
 use crate::providers::Provider;
 
-use wire::{
-    WireChatRequest, WireResponse, WireStreamOptions, WireStreamResponse, WireToolCall,
+use types::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, StreamOptions, ToolCall,
 };
 
 const CHAT_PATH: &str = "/chat/completions";
@@ -40,66 +38,17 @@ impl OpenAiCompatible {
         &self.provider
     }
 
-    /// 非流式 chat completions。
+    /// 非流式 `POST /chat/completions`。
     pub async fn chat_completions(
         &self,
-        wire: &WireChatRequest,
-    ) -> Result<WireResponse, ModelError> {
-        Ok(self.provider.post_json(CHAT_PATH, wire).await?)
+        request: &ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, ModelError> {
+        Ok(self.provider.post_json(CHAT_PATH, request).await?)
     }
-}
-
-fn message_from_wire(message: wire::WireChoiceMessage, default_audio_format: &str) -> Message {
-    let mut parts = Vec::new();
-
-    if let Some(reasoning) = message.reasoning_content
-        && !reasoning.is_empty()
-    {
-        parts.push(ContentPart::reasoning(reasoning));
-    }
-
-    if let Some(content) = message.content
-        && !content.is_empty()
-    {
-        parts.push(ContentPart::text(content));
-    }
-
-    if let Some(images) = message.images {
-        for img in images {
-            if !img.image_url.url.trim().is_empty() {
-                parts.push(ContentPart::image_url(img.image_url.url));
-            }
-        }
-    }
-
-    if let Some(audio) = message.audio
-        && let Some(data) = audio.data.filter(|d| !d.is_empty())
-    {
-        let format = audio
-            .format
-            .as_deref()
-            .unwrap_or(default_audio_format);
-        parts.push(ContentPart::Audio {
-            source: MediaSource::base64(audio_format_to_mime(format), data),
-            transcript: audio.transcript,
-        });
-    }
-
-    if let Some(tool_calls) = message.tool_calls {
-        for call in tool_calls {
-            parts.push(ContentPart::ToolCall(call.into_domain()));
-        }
-    }
-
-    if message.role == MessageRole::Tool {
-        return Message::tool_result_parts(message.tool_call_id.unwrap_or_default(), parts, false);
-    }
-
-    Message::new(message.role, parts)
 }
 
 /// 把一条流式工具调用增量并进累积状态。
-fn accumulate_tool_calls(accumulated: &mut Vec<WireToolCall>, deltas: &[WireToolCall]) {
+fn accumulate_tool_calls(accumulated: &mut Vec<ToolCall>, deltas: &[ToolCall]) {
     for delta in deltas {
         match accumulated
             .iter_mut()
@@ -142,8 +91,8 @@ impl GenerateCapability for OpenAiCompatible {
             .audio_options()
             .and_then(|o| o.format.clone())
             .unwrap_or_else(|| "wav".to_string());
-        let wire = WireChatRequest::try_from(&request)?;
-        let response = self.chat_completions(&wire).await?;
+        let body = ChatCompletionRequest::try_from(&request)?;
+        let response = self.chat_completions(&body).await?;
         let choice = response
             .choices
             .into_iter()
@@ -151,7 +100,7 @@ impl GenerateCapability for OpenAiCompatible {
             .ok_or(ModelError::NoResponse)?;
 
         Ok(GenerateResponse {
-            message: message_from_wire(choice.message, &default_audio_format),
+            message: convert::choice_message_to_domain(choice.message, &default_audio_format),
             finish_reason: choice.finish_reason.as_deref().map(FinishReason::from_wire),
             usage: response.usage.map(Into::into),
             model: (!response.model.is_empty()).then_some(response.model),
@@ -168,22 +117,22 @@ impl GenerateCapability for OpenAiCompatible {
             .audio_options()
             .and_then(|o| o.format.clone())
             .unwrap_or_else(|| "wav".to_string());
-        let mut wire = WireChatRequest::try_from(&request)?;
-        wire.stream = Some(true);
-        let has_custom_stream_options = wire
+        let mut body = ChatCompletionRequest::try_from(&request)?;
+        body.stream = Some(true);
+        let has_custom_stream_options = body
             .extra
             .as_ref()
             .is_some_and(|map| map.contains_key("stream_options"));
         if !has_custom_stream_options {
-            wire.stream_options = Some(WireStreamOptions {
+            body.stream_options = Some(StreamOptions {
                 include_usage: true,
             });
         }
 
-        let mut events = self.provider.post_sse(CHAT_PATH, &wire).await?;
+        let mut events = self.provider.post_sse(CHAT_PATH, &body).await?;
 
         let stream = async_stream::stream! {
-            let mut accumulated_tools: Vec<WireToolCall> = Vec::new();
+            let mut accumulated_tools: Vec<ToolCall> = Vec::new();
 
             while let Some(item) = events.next().await {
                 let sse_event = match item {
@@ -211,7 +160,7 @@ impl GenerateCapability for OpenAiCompatible {
                     return;
                 }
 
-                let parsed = match serde_json::from_str::<WireStreamResponse>(payload) {
+                let parsed = match serde_json::from_str::<ChatCompletionChunk>(payload) {
                     Ok(parsed) => parsed,
                     Err(error) => {
                         warn!(%error, payload, "skipping undecodable stream event");
@@ -254,7 +203,7 @@ impl GenerateCapability for OpenAiCompatible {
 
                     if let Some(reason) = choice.finish_reason {
                         for call in accumulated_tools.drain(..) {
-                            yield Ok(StreamEvent::Part(ContentPart::ToolCall(call.into_domain())));
+                            yield Ok(StreamEvent::Part(ContentPart::ToolCall(call.into())));
                         }
                         yield Ok(StreamEvent::Finished {
                             reason: Some(FinishReason::from_wire(&reason)),
@@ -269,7 +218,7 @@ impl GenerateCapability for OpenAiCompatible {
 
             // 兼容省略 finish_reason 的服务端：流末尾兜底冲刷累积工具调用。
             for call in accumulated_tools.drain(..) {
-                yield Ok(StreamEvent::Part(ContentPart::ToolCall(call.into_domain())));
+                yield Ok(StreamEvent::Part(ContentPart::ToolCall(call.into())));
             }
         };
 
